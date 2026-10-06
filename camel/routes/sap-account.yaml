@@ -1,0 +1,139 @@
+- route:
+    id: sap-account
+    autoStartup: false
+    errorHandler:
+      deadLetterChannel:
+        deadLetterUri: "kafka:dlq.sap.account?brokers=redpanda:9092"
+        useOriginalMessage: true
+        redeliveryPolicy:
+          maximumRedeliveries: 0
+    from:
+      uri: kafka:crm.account.upserted.v1
+      parameters:
+        brokers: redpanda:9092
+        groupId: ibus-sap
+        autoOffsetReset: earliest
+        autoCommitIntervalMs: 500
+      steps:
+        - unmarshal:
+            json: {}
+        - setProperty:
+            name: event
+            groovy: |
+              return body
+        - setProperty:
+            name: cardCode
+            groovy: |
+              def data = exchange.getProperty('event', Map).get('data')
+              def code = data.get('Code')
+              if (code != null && code.toString().trim()) {
+                def value = code.toString().trim()
+                return value.length() > 15 ? value.substring(0, 15) : value
+              }
+              def compact = data.get('Id').toString().replace('-', '')
+              return compact.length() > 15 ? compact.substring(0, 15) : compact
+        - setBody:
+            constant: '{"CompanyDB":"SBODEMO","UserName":"manager","Password":"manager"}'
+        - removeHeaders:
+            pattern: ".*"
+        - setHeader:
+            name: Content-Type
+            constant: application/json
+        - setHeader:
+            name: CamelHttpMethod
+            constant: POST
+        - to: "http://sap-b1:8080/b1s/v1/Login?bridgeEndpoint=true"
+        - unmarshal:
+            json: {}
+        - setProperty:
+            name: sessionId
+            simple: "${body[SessionId]}"
+        - removeHeaders:
+            pattern: ".*"
+        - setHeader:
+            name: Cookie
+            simple: "B1SESSION=${exchangeProperty.sessionId}"
+        - setHeader:
+            name: CamelHttpMethod
+            constant: GET
+        - toD: "http://sap-b1:8080/b1s/v1/BusinessPartners('${exchangeProperty.cardCode}')?bridgeEndpoint=true&throwExceptionOnFailure=false"
+        - setProperty:
+            name: sapExists
+            groovy: |
+              def code = exchange.getMessage().getHeader('CamelHttpResponseCode')
+              return (code != null && code.toString() == '200') ? 'yes' : 'no'
+        - choice:
+            when:
+              - simple: "${exchangeProperty.sapExists} == 'yes'"
+                steps:
+                  - setBody:
+                      groovy: |
+                        def data = exchange.getProperty('event', Map).get('data')
+                        def code = exchange.getProperty('cardCode')
+                        def body = new java.util.LinkedHashMap()
+                        body.put('CardName', data.get('Name'))
+                        body.put('CardType', 'cCustomer')
+                        body.put('Phone1', data.get('Phone') ?: '')
+                        body.put('Website', data.get('Web') ?: '')
+                        body.put('FederalTaxID', data.get('TaxId') ?: '')
+                        def address = new java.util.LinkedHashMap()
+                        address.put('AddressName', 'Bill')
+                        address.put('Street', data.get('Address') ?: '')
+                        address.put('ZipCode', data.get('Zip') ?: '')
+                        address.put('AddressType', 'bo_BillTo')
+                        address.put('BPCode', code)
+                        body.put('BPAddresses', [address])
+                        return body
+                  - marshal:
+                      json: {}
+                  - removeHeaders:
+                      pattern: ".*"
+                  - setHeader:
+                      name: Content-Type
+                      constant: application/json
+                  - setHeader:
+                      name: Cookie
+                      simple: "B1SESSION=${exchangeProperty.sessionId}"
+                  - setHeader:
+                      name: CamelHttpMethod
+                      constant: PATCH
+                  - convertBodyTo:
+                      type: byte[]
+                  - toD: "http://sap-b1:8080/b1s/v1/BusinessPartners('${exchangeProperty.cardCode}')?bridgeEndpoint=true"
+            otherwise:
+              steps:
+                - setBody:
+                    groovy: |
+                      def data = exchange.getProperty('event', Map).get('data')
+                      def code = exchange.getProperty('cardCode')
+                      def body = new java.util.LinkedHashMap()
+                      body.put('CardCode', code)
+                      body.put('CardName', data.get('Name'))
+                      body.put('CardType', 'cCustomer')
+                      body.put('Phone1', data.get('Phone') ?: '')
+                      body.put('Website', data.get('Web') ?: '')
+                      body.put('FederalTaxID', data.get('TaxId') ?: '')
+                      def address = new java.util.LinkedHashMap()
+                      address.put('AddressName', 'Bill')
+                      address.put('Street', data.get('Address') ?: '')
+                      address.put('ZipCode', data.get('Zip') ?: '')
+                      address.put('AddressType', 'bo_BillTo')
+                      address.put('BPCode', code)
+                      body.put('BPAddresses', [address])
+                      return body
+                - marshal:
+                    json: {}
+                - removeHeaders:
+                    pattern: ".*"
+                - setHeader:
+                    name: Content-Type
+                    constant: application/json
+                - setHeader:
+                    name: Cookie
+                    simple: "B1SESSION=${exchangeProperty.sessionId}"
+                - setHeader:
+                    name: CamelHttpMethod
+                    constant: POST
+                - convertBodyTo:
+                    type: byte[]
+                - to: "http://sap-b1:8080/b1s/v1/BusinessPartners?bridgeEndpoint=true"

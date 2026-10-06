@@ -1,0 +1,86 @@
+name: ibus
+
+services:
+  creatio:
+    build: ../emulators
+    image: ibus-emulator:pilot
+    container_name: ibus-creatio
+    environment:
+      SERVICE: creatio
+      BUS_URL: http://ibus-camel:8080/ingress/accounts
+    ports:
+      - "127.0.0.1:8891:8080"
+    networks:
+      - redpanda_default
+    restart: unless-stopped
+
+  sap-b1:
+    image: ibus-emulator:pilot
+    container_name: ibus-sap-b1
+    environment:
+      SERVICE: sap
+    ports:
+      - "127.0.0.1:8892:8080"
+    networks:
+      - redpanda_default
+    restart: unless-stopped
+
+  directum-rx:
+    image: ibus-emulator:pilot
+    container_name: ibus-directum-rx
+    environment:
+      SERVICE: directum
+    ports:
+      - "127.0.0.1:8893:8080"
+    networks:
+      - redpanda_default
+    restart: unless-stopped
+
+  stand:
+    build: ../stand
+    image: ibus-stand:pilot
+    container_name: ibus-stand
+    environment:
+      CREATIO_URL: http://ibus-creatio:8080
+      SAP_URL: http://sap-b1:8080
+      DIRECTUM_URL: http://directum-rx:8080
+      CAMEL_URL: http://ibus-camel:8080
+      BROKERS: redpanda:9092
+    ports:
+      - "8894:8080"
+    networks:
+      - redpanda_default
+    depends_on:
+      - creatio
+      - sap-b1
+      - directum-rx
+    restart: unless-stopped
+
+  ibus-camel:
+    image: apache/camel-jbang:4.22.1
+    container_name: ibus-camel
+    command:
+      - run
+      - /integrations/ingress.yaml
+      - /integrations/sap-account.yaml
+      - /integrations/directum-account.yaml
+      - /integrations/control.yaml
+      - --dep=camel:kafka
+      - --dep=camel:http
+      - --dep=camel:jackson
+      - --dep=camel:groovy
+      - --dep=camel:platform-http
+    volumes:
+      - ../camel/routes:/integrations:ro
+    ports:
+      - "127.0.0.1:8890:8080"
+    networks:
+      - redpanda_default
+    depends_on:
+      - sap-b1
+      - directum-rx
+    restart: unless-stopped
+
+networks:
+  redpanda_default:
+    external: true

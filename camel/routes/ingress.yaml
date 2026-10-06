@@ -1,0 +1,86 @@
+- route:
+    id: ingress-health
+    from:
+      uri: platform-http:/health
+      parameters:
+        httpMethodRestrict: GET
+      steps:
+        - setHeader:
+            name: Content-Type
+            constant: application/json
+        - setBody:
+            constant: '{"status":"ok"}'
+
+- route:
+    id: ingress-account
+    from:
+      uri: platform-http:/ingress/accounts
+      parameters:
+        httpMethodRestrict: POST
+      steps:
+        - unmarshal:
+            json: {}
+        - setProperty:
+            name: account
+            simple: "${body}"
+        - setProperty:
+            name: accountValid
+            groovy: |
+              def account = exchange.getProperty('account', Map)
+              def id = account.get('Id')
+              def name = account.get('Name')
+              if (id != null && !id.toString().trim().isEmpty() && name != null && !name.toString().trim().isEmpty()) {
+                return 'yes'
+              }
+              return 'no'
+        - choice:
+            when:
+              - simple: "${exchangeProperty.accountValid} == 'no'"
+                steps:
+                  - setHeader:
+                      name: Content-Type
+                      constant: application/json
+                  - setHeader:
+                      name: CamelHttpResponseCode
+                      constant: "400"
+                  - setBody:
+                      constant: '{"error":"Id and Name are required"}'
+            otherwise:
+              steps:
+                - setBody:
+                    groovy: |
+                      def account = exchange.getProperty('account', Map)
+                      def eventId = java.util.UUID.randomUUID().toString()
+                      def event = new java.util.LinkedHashMap()
+                      event.put('specversion', '1.0')
+                      event.put('id', eventId)
+                      event.put('source', 'creatio/accounts')
+                      event.put('type', 'com.company.crm.account.upserted')
+                      event.put('time', java.time.Instant.now().toString())
+                      event.put('subject', account.get('Id').toString())
+                      event.put('correlationid', eventId)
+                      event.put('datacontenttype', 'application/json')
+                      event.put('data', account)
+                      return event
+                - marshal:
+                    json: {}
+                - setProperty:
+                    name: eventJson
+                    simple: "${body}"
+                - removeHeaders:
+                    pattern: ".*"
+                - setHeader:
+                    name: kafka.KEY
+                    simple: "${exchangeProperty.account[Id]}"
+                - to:
+                    uri: kafka:crm.account.upserted.v1
+                    parameters:
+                      brokers: redpanda:9092
+                - setHeader:
+                    name: Content-Type
+                    constant: application/json
+                - setHeader:
+                    name: CamelHttpResponseCode
+                    constant: "202"
+                - setBody:
+                    simple: "${exchangeProperty.eventJson}"

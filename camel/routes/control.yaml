@@ -1,0 +1,36 @@
+# Start or stop one reader route. The route stays stopped until the stand
+# button for that system is pressed, so a message can sit in the topic first.
+- route:
+    id: control-consumer
+    from:
+      uri: platform-http:/control/{system}/{action}
+      parameters:
+        httpMethodRestrict: POST
+      steps:
+        - setBody:
+            groovy: |
+              def system = exchange.getMessage().getHeader('system', String.class)
+              def action = exchange.getMessage().getHeader('action', String.class)
+              if (!system || !action) {
+                def path = exchange.getMessage().getHeader('CamelHttpPath', String.class) ?: ''
+                def parts = path.split('/').findAll { it }
+                if (!system && parts.size() > 1) system = parts[1]
+                if (!action && parts.size() > 2) action = parts[2]
+              }
+              def routeId = system == 'directum' ? 'directum-account' : 'sap-account'
+              def controller = exchange.getContext().getRouteController()
+              def status = controller.getRouteStatus(routeId)
+              def started = status != null && status.isStarted()
+              if (action == 'stop') {
+                if (started) {
+                  controller.stopRoute(routeId)
+                }
+                return '{"status":"stopped","route":"' + routeId + '"}'
+              }
+              if (!started) {
+                controller.startRoute(routeId)
+              }
+              return '{"status":"started","route":"' + routeId + '"}'
+        - setHeader:
+            name: Content-Type
+            constant: application/json

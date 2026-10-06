@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "crm.account.upserted.v1",
+  "title": "Creatio account saved",
+  "description": "Fact that a counterparty was saved in Creatio. Target-specific requests are not part of this body.",
+  "type": "object",
+  "required": ["specversion", "id", "source", "type", "time", "subject", "correlationid", "data"],
+  "properties": {
+    "specversion": { "const": "1.0" },
+    "id": { "type": "string" },
+    "source": { "const": "creatio/accounts" },
+    "type": { "const": "com.company.crm.account.upserted" },
+    "time": { "type": "string" },
+    "subject": { "type": "string", "description": "Creatio Account.Id" },
+    "correlationid": { "type": "string" },
+    "datacontenttype": { "const": "application/json" },
+    "data": {
+      "type": "object",
+      "required": ["Id", "Name"],
+      "properties": {
+        "Id": { "type": "string" },
+        "Name": { "type": "string", "minLength": 1 },
+        "Code": { "type": "string" },
+        "Phone": { "type": "string" },
+        "Web": { "type": "string" },
+        "Address": { "type": "string" },
+        "Zip": { "type": "string" },
+        "Notes": { "type": "string" },
+        "AlternativeName": { "type": "string" },
+        "ModifiedOn": { "type": "string" },
+        "TaxId": {
+          "type": "string",
+          "description": "Not a base Creatio Account column. Pilot field for SAP FederalTaxID and Directum TIN."
+        }
+      }
+    }
+  }
+}

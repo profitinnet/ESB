@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Стенд: контрагент из Creatio</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f0e8;
+      --ink: #1c1915;
+      --muted: #5e584e;
+      --line: #d9d2c5;
+      --card: #fffdf8;
+      --accent: #0f6e56;
+      --accent-ink: #ffffff;
+      --warn: #8a4b08;
+      --bad: #8f1d1d;
+      --ok: #0f6e56;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.45 "Segoe UI", system-ui, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+    }
+    header, main { width: min(1300px, calc(100% - 32px)); margin: 0 auto; }
+    header { padding: 24px 0 10px; display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
+    header .intro { min-width: 0; }
+    h1 { font-size: 28px; line-height: 1.2; margin: 0 0 10px; }
+    button.clear-stand { white-space: nowrap; padding: 10px 16px; }
+    h2 { font-size: 18px; margin: 0 0 12px; }
+    h3 { font-size: 14px; margin: 0 0 8px; color: var(--muted); }
+    p { margin: 0; }
+    a { color: var(--accent); }
+    .lead { color: var(--muted); max-width: 76ch; }
+    .layout { display: grid; grid-template-columns: 360px 1fr; gap: 16px; margin-top: 18px; }
+    .boards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .card { border-left: 4px solid var(--accent); }
+    label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+    input, .readonly {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font: inherit;
+      background: #fff;
+    }
+    .readonly { background: #f7f4ee; color: var(--muted); }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 16px; }
+    button {
+      font: inherit;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #fff;
+      padding: 10px 12px;
+      cursor: pointer;
+    }
+    button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+    button.warn { border-color: var(--warn); color: var(--warn); }
+    button.bad { border-color: var(--bad); color: var(--bad); }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    .hint { margin-top: 14px; color: var(--muted); font-size: 13px; }
+    .status { min-height: 2.8em; margin-top: 12px; font-size: 14px; }
+    .status.bad { color: var(--bad); }
+    .card-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+    .count { color: var(--muted); font-size: 13px; }
+    ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+    li {
+      border-top: 1px solid var(--line);
+      padding-top: 8px;
+    }
+    li:first-child { border-top: 0; padding-top: 0; }
+    .name { font-weight: 650; }
+    .meta { color: var(--muted); font-size: 13px; word-break: break-all; }
+    .empty { color: var(--muted); font-size: 14px; }
+    .topics, .packets { margin: 16px 0 0; }
+    .topic-grid { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 12px; }
+    .packet-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+    .step { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+    details { margin-top: 6px; }
+    summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #f7f4ee;
+      border-radius: 8px;
+      padding: 10px;
+      margin: 8px 0 0;
+      font: 12px/1.4 ui-monospace, Consolas, monospace;
+      max-height: 240px;
+      overflow: auto;
+    }
+    .err { color: var(--bad); font-size: 13px; margin-top: 6px; }
+    @media (max-width: 1000px) {
+      .layout, .boards, .topic-grid, .packet-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="intro">
+      <h1>Стенд: контрагент из Creatio</h1>
+      <p class="lead">Эмуляция интеграционной шины. Сначала карточка живёт только в Creatio. Потом Camel кладёт один факт CloudEvents в топик <code>crm.account.upserted.v1</code>. SAP и Directum забирают его только по своим кнопкам: читатели выключены, пока кнопку не нажать.</p>
+    </div>
+    <button class="bad clear-stand" id="clear" type="button">Очистить стенд</button>
+  </header>
+  <main>
+    <div class="layout">
+      <section class="card">
+        <h2>Карточка контрагента</h2>
+        <label for="name">Название</label>
+        <input id="name" value="Accom">
+
+        <label for="code">Код SAP (CardCode)</label>
+        <input id="code" value="">
+
+        <label for="phone">Телефон</label>
+        <input id="phone" value="+380441112233">
+
+        <label for="web">Сайт</label>
+        <input id="web" value="https://accom.example">
+
+        <label for="address">Адрес</label>
+        <input id="address" value="Khreshchatyk 1">
+
+        <label for="zip">Индекс</label>
+        <input id="zip" value="01001">
+
+        <label for="tax">Налоговый номер</label>
+        <input id="tax" value="12345678">
+
+        <label for="id">Идентификатор Creatio</label>
+        <div class="readonly" id="id">—</div>
+
+        <div class="actions">
+          <button class="primary" id="create" type="button">1. Создать в Creatio</button>
+          <button id="edit" type="button">1. Изменить в Creatio</button>
+          <button class="primary" id="publish" type="button">2. Положить в топик</button>
+          <button id="to-sap" type="button">3. Получить в SAP</button>
+          <button id="to-directum" type="button">3. Получить в Directum</button>
+          <button class="warn" id="fail" type="button">Directum недоступен</button>
+        </div>
+
+        <p class="status" id="status">Шаг 1 — записать карточку в Creatio. В топик она сама не уйдёт.</p>
+
+        <p class="hint">
+          <strong>Создать</strong> и <strong>Изменить</strong> пишут только в Creatio. Почему отдельно: иначе не видно, что продюсер и топик — разные шаги.<br>
+          <strong>Положить в топик</strong> — Camel собирает конверт CloudEvents и публикует его. SAP и Directum ещё молчат.<br>
+          <strong>Получить</strong> — на время чтения включается одна группа. Ниже видно тело, которое Camel отправил в эту систему.<br>
+          После <strong>Изменить</strong> снова нажмите «Положить в топик» и обе кнопки получения: ниже появятся уже новые тела.<br>
+          <strong>Directum недоступен</strong> новое сообщение не создаёт. Читатель забирает то, что уже лежит в топике, Directum на этот запрос не отвечает, карточка не появляется, а то же сообщение попадает в топик ошибок Directum.
+        </p>
+      </section>
+
+      <div class="boards">
+        <section>
+          <div class="card-head"><h2>Creatio</h2><span class="count" id="creatio-count"></span></div>
+          <div id="creatio"></div>
+        </section>
+        <section>
+          <div class="card-head"><h2>SAP Business One</h2><span class="count" id="sap-count"></span></div>
+          <div id="sap"></div>
+        </section>
+        <section>
+          <div class="card-head"><h2>Directum RX</h2><span class="count" id="directum-count"></span></div>
+          <div id="directum"></div>
+        </section>
+      </div>
+    </div>
+
+    <section class="packets">
+      <h2>Пакеты по шагам</h2>
+      <p class="lead">Слева то, что создал Creatio и что лежит в топике. Справа — тела HTTP, которые Camel отправил в SAP и Directum после преобразования. Это не копия карточки Creatio.</p>
+      <div class="packet-grid">
+        <section>
+          <p class="step">Шаг 1. Карточка в Creatio</p>
+          <pre id="packet-creatio">Пока пусто.</pre>
+        </section>
+        <section>
+          <p class="step">Шаг 2. Сообщение в топике</p>
+          <pre id="packet-topic">Пока пусто.</pre>
+        </section>
+        <section>
+          <p class="step">Шаг 3. Тело для SAP BusinessPartners</p>
+          <pre id="packet-sap">Пока пусто.</pre>
+        </section>
+        <section>
+          <p class="step">Шаг 3. Тело для Directum ICompanies</p>
+          <pre id="packet-directum">Пока пусто.</pre>
+        </section>
+      </div>
+    </section>
+
+    <section class="topics">
+      <div class="card-head">
+        <h2>Топики Redpanda</h2>
+        <a id="console" href="#" target="_blank">Открыть в Redpanda Console</a>
+      </div>
+      <p class="lead">В каждом топике — лента сообщений. <strong>Факт изменения</strong> получают все группы чтения. <strong>Ошибки SAP</strong> и <strong>Ошибки Directum</strong> — это отдельные топики, куда падают сообщения, если соответствующая система отказала.</p>
+      <div class="topic-grid" id="topics"></div>
+    </section>
+  </main>
+
+  <script>
+    const fields = ["name", "code", "phone", "web", "address", "zip", "tax"];
+    const statusEl = document.querySelector("#status");
+    const idEl = document.querySelector("#id");
+    const topicTitles = {
+      "crm.account.upserted.v1": "Факт изменения",
+      "dlq.sap.account": "Ошибки SAP",
+      "dlq.directum.account": "Ошибки Directum"
+    };
+
+    document.querySelector("#console").href = location.protocol + "//" + location.hostname + ":8088/topics/crm.account.upserted.v1";
+
+    function val(id) { return document.querySelector("#" + id).value.trim(); }
+    function setStatus(text, bad) {
+      statusEl.textContent = text;
+      statusEl.classList.toggle("bad", !!bad);
+    }
+    function newId() {
+      if (typeof crypto !== "undefined" && crypto.randomUUID) {
+        return crypto.randomUUID();
+      }
+      return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+        const r = Math.random() * 16 | 0;
+        const v = c === "x" ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+    }
+    function newCode(id) { return ("C" + id.replaceAll("-", "").slice(0, 8)).toUpperCase(); }
+    function currentAccount(id) {
+      return {
+        Id: id,
+        Name: val("name"),
+        Code: val("code"),
+        Phone: val("phone"),
+        Web: val("web"),
+        Address: val("address"),
+        Zip: val("zip"),
+        Notes: "",
+        AlternativeName: "",
+        TaxId: val("tax")
+      };
+    }
+    function fillNew() {
+      idEl.textContent = "—";
+      if (!val("code")) document.querySelector("#code").value = "";
+      document.querySelector("#name").value = "Accom";
+      document.querySelector("#phone").value = "+380441112233";
+      document.querySelector("#web").value = "https://accom.example";
+      document.querySelector("#address").value = "Khreshchatyk 1";
+      document.querySelector("#zip").value = "01001";
+      document.querySelector("#tax").value = "12345678";
+    }
+    function renderList(target, rows, draw) {
+      const root = document.querySelector(target);
+      const count = document.querySelector(target + "-count");
+      count.textContent = rows.length ? String(rows.length) : "";
+      root.replaceChildren();
+      if (!rows.length) {
+        const p = document.createElement("p");
+        p.className = "empty";
+        p.textContent = "Пока пусто.";
+        root.appendChild(p);
+        return;
+      }
+      const list = document.createElement("ul");
+      rows.forEach((row) => list.appendChild(draw(row)));
+      root.appendChild(list);
+    }
+    function item(title, lines) {
+      const li = document.createElement("li");
+      const name = document.createElement("div");
+      name.className = "name";
+      name.textContent = title || "без названия";
+      li.appendChild(name);
+      lines.forEach((line) => {
+        const div = document.createElement("div");
+        div.className = "meta";
+        div.textContent = line;
+        li.appendChild(div);
+      });
+      return li;
+    }
+    let topicsSignature = "";
+    function renderTopics(topics, errors) {
+      const signature = JSON.stringify({ topics: topics, error: errors.topics || "" });
+      if (signature === topicsSignature) return;
+      const openKeys = new Set();
+      document.querySelectorAll("#topics details[open]").forEach((node) => {
+        if (node.dataset.key) openKeys.add(node.dataset.key);
+      });
+      topicsSignature = signature;
+      const root = document.querySelector("#topics");
+      root.replaceChildren();
+      Object.keys(topicTitles).forEach((name) => {
+        const box = document.createElement("section");
+        const head = document.createElement("div");
+        head.className = "card-head";
+        const title = document.createElement("h2");
+        title.textContent = topicTitles[name];
+        const count = document.createElement("span");
+        count.className = "count";
+        const data = topics[name] || { count: 0, messages: [] };
+        count.textContent = data.count ? String(data.count) : "0";
+        head.append(title, count);
+        box.appendChild(head);
+        const hint = document.createElement("p");
+        hint.className = "meta";
+        hint.textContent = name;
+        box.appendChild(hint);
+        if (!data.messages.length) {
+          const empty = document.createElement("p");
+          empty.className = "empty";
+          empty.textContent = "Сообщений нет.";
+          box.appendChild(empty);
+        } else {
+          const list = document.createElement("ul");
+          data.messages.forEach((message) => {
+            const value = message.value || {};
+            const dataPart = value.data || {};
+            const when = message.timestamp ? new Date(message.timestamp).toLocaleString() : "";
+            const li = item(dataPart.Name || value.subject || "сообщение", [
+              when,
+              dataPart.Id ? "Id " + dataPart.Id : "",
+              "раздел " + message.partition + ", позиция " + message.offset
+            ].filter(Boolean));
+            const details = document.createElement("details");
+            details.dataset.key = name + ":" + message.partition + ":" + message.offset;
+            if (openKeys.has(details.dataset.key)) details.open = true;
+            const summary = document.createElement("summary");
+            summary.textContent = "Текст сообщения";
+            const pre = document.createElement("pre");
+            pre.textContent = JSON.stringify(value, null, 2);
+            details.append(summary, pre);
+            li.appendChild(details);
+            list.appendChild(li);
+          });
+          box.appendChild(list);
+        }
+        if (errors.topics) {
+          const err = document.createElement("p");
+          err.className = "err";
+          err.textContent = errors.topics;
+          box.appendChild(err);
+        }
+        root.appendChild(box);
+      });
+    }
+    async function refresh() {
+      const response = await fetch("/api/snapshot", { cache: "no-store" });
+      const data = await response.json();
+      const errors = data.errors || {};
+      renderList("#creatio", data.creatio || [], (row) => item(row.Name, [
+        row.Code ? "код " + row.Code : "",
+        "Id " + row.Id,
+        row.TaxId ? "налог " + row.TaxId : ""
+      ].filter(Boolean)));
+      renderList("#sap", data.sap || [], (row) => item(row.CardName, [
+        "CardCode " + row.CardCode,
+        row.FederalTaxID ? "налог " + row.FederalTaxID : "",
+        row.Phone1 ? row.Phone1 : ""
+      ].filter(Boolean)));
+      renderList("#directum", data.directum || [], (row) => item(row.Name, [
+        "номер Directum " + row.Id,
+        "связь " + row.Code,
+        row.TIN ? "налог " + row.TIN : ""
+      ].filter(Boolean)));
+      ["creatio", "sap", "directum"].forEach((key) => {
+        if (!errors[key]) return;
+        const err = document.createElement("p");
+        err.className = "err";
+        err.textContent = errors[key];
+        document.querySelector("#" + key).appendChild(err);
+      });
+      renderTopics(data.topics || {}, errors);
+      const currentId = idEl.textContent.trim();
+      const idKnown = !!currentId && currentId !== "—";
+      const creatioRows = data.creatio || [];
+      const creatioMatch = creatioRows.filter((row) => row.Id === currentId);
+      const creatioPacket = idKnown
+        ? (creatioMatch[creatioMatch.length - 1] || null)
+        : (creatioRows[creatioRows.length - 1] || null);
+      showPacket("packet-creatio", creatioPacket, true);
+      const topicMessages = ((data.topics || {})["crm.account.upserted.v1"] || {}).messages || [];
+      const topicMatch = topicMessages.filter((message) => ((message.value || {}).data || {}).Id === currentId || (message.value || {}).subject === currentId);
+      const topicPacket = idKnown
+        ? (topicMatch.length ? topicMatch[0].value : null)
+        : (topicMessages.length ? topicMessages[0].value : null);
+      showPacket("packet-topic", topicPacket, true);
+      const code = val("code");
+      const company = (data.directum || []).find((row) => row.Code === currentId);
+      showPacket("packet-sap", formatInbox(latestRow(data.sapPackets || [], (row) => matchesSap(row, code), idKnown)), true);
+      showPacket("packet-directum", formatInbox(latestRow(data.directumPackets || [], (row) => matchesDirectum(row, currentId, company), idKnown)), true);
+    }
+    function matchesSap(row, code) {
+      if (!code) return false;
+      if (row.body && row.body.CardCode === code) return true;
+      return (row.path || "").indexOf("BusinessPartners('" + code + "')") >= 0;
+    }
+    function matchesDirectum(row, id, company) {
+      if (row.body && row.body.Code === id) return true;
+      if (company && (row.path || "").indexOf("ICompanies(" + company.Id + ")") >= 0) return true;
+      return false;
+    }
+    function latestRow(rows, predicate, restrict) {
+      const chosen = restrict ? rows.filter(predicate) : rows;
+      if (!chosen.length) return null;
+      return chosen[chosen.length - 1];
+    }
+    function formatInbox(row) {
+      if (!row) return null;
+      const head = [row.method, row.path].filter(Boolean).join(" ");
+      const body = JSON.stringify(row.body, null, 2);
+      return head ? head + "\n" + body : body;
+    }
+    function showPacket(id, value, allowEmpty) {
+      if (value == null && !allowEmpty) return;
+      const el = document.querySelector("#" + id);
+      const text = value == null ? "Пока пусто." : (typeof value === "string" ? value : JSON.stringify(value, null, 2));
+      if (el.textContent !== text) el.textContent = text;
+    }
+    function requireId() {
+      const id = idEl.textContent.trim();
+      if (!id || id === "—") {
+        setStatus("Сначала запишите карточку в Creatio.", true);
+        return "";
+      }
+      return id;
+    }
+    async function withButtons(note, action) {
+      const buttons = document.querySelectorAll("button");
+      buttons.forEach((button) => { button.disabled = true; });
+      setStatus(note);
+      try {
+        await action();
+      } catch (error) {
+        setStatus(String(error), true);
+      } finally {
+        buttons.forEach((button) => { button.disabled = false; });
+      }
+    }
+    async function saveCreatio(note) {
+      const account = currentAccount(idEl.textContent.trim());
+      await withButtons(note, async () => {
+        const response = await fetch("/api/accounts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(account)
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          setStatus(payload.error || "Creatio не принял карточку", true);
+          return;
+        }
+        idEl.textContent = payload.Id || account.Id;
+        showPacket("packet-creatio", payload, true);
+        setStatus("Карточка в Creatio. Топик, SAP и Directum ещё не затронуты.");
+        await refresh();
+      });
+    }
+    document.querySelector("#create").onclick = () => {
+      const id = newId();
+      document.querySelector("#code").value = newCode(id);
+      idEl.textContent = id;
+      saveCreatio("Записываю карточку только в Creatio.");
+    };
+    document.querySelector("#edit").onclick = () => {
+      if (!requireId()) return;
+      const name = val("name").replace(/ \(изменено\)$/, "") + " (изменено)";
+      document.querySelector("#name").value = name;
+      saveCreatio("Меняю карточку в Creatio. В топик это попадёт отдельной кнопкой.");
+    };
+    document.querySelector("#publish").onclick = () => {
+      const id = requireId();
+      if (!id) return;
+      const account = currentAccount(id);
+      withButtons("Camel собирает CloudEvents и кладёт сообщение в топик.", async () => {
+        const response = await fetch("/api/publish", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(account)
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          setStatus((payload && payload.error) || "Топик не принял сообщение", true);
+          return;
+        }
+        showPacket("packet-topic", payload.event || payload, true);
+        setStatus("Сообщение в топике. SAP и Directum его ещё не читали.");
+        await refresh();
+      });
+    };
+    async function deliver(system, note, packetId, doneText, emptyText) {
+      await withButtons(note, async () => {
+        const response = await fetch("/api/deliver/" + system, { method: "POST" });
+        const payload = await response.json();
+        if (!response.ok) {
+          setStatus((payload && payload.error) || "Читатель не запустился", true);
+          return;
+        }
+        const packets = payload.packets || [];
+        if (!packets.length) {
+          setStatus(emptyText, true);
+          return;
+        }
+        showPacket(packetId, formatInbox(packets[packets.length - 1]), true);
+        setStatus(doneText);
+        await refresh();
+      });
+    }
+    document.querySelector("#to-sap").onclick = () => {
+      deliver(
+        "sap",
+        "Включаю читателя SAP. Он заберёт сообщения из топика и Camel отправит BusinessPartners.",
+        "packet-sap",
+        "SAP получил пакет. Тело — в блоке «Тело для SAP».",
+        "Для SAP новых сообщений нет. Сначала положите карточку в топик."
+      );
+    };
+    document.querySelector("#to-directum").onclick = () => {
+      deliver(
+        "directum",
+        "Включаю читателя Directum. Camel отправит ICompanies.",
+        "packet-directum",
+        "Directum получил пакет. Тело — в блоке «Тело для Directum».",
+        "Для Directum новых сообщений нет. Сначала положите карточку в топик."
+      );
+    };
+    document.querySelector("#fail").onclick = () => {
+      withButtons("Directum недоступен. Забираю сообщение, которое уже лежит в топике.", async () => {
+        const before = await fetch("/api/snapshot", { cache: "no-store" }).then((response) => response.json());
+        const topicBefore = ((before.topics || {})["crm.account.upserted.v1"] || {}).count || 0;
+        const errorsBefore = ((before.topics || {})["dlq.directum.account"] || {}).count || 0;
+        const response = await fetch("/api/deliver/directum/down", { method: "POST" });
+        const payload = await response.json();
+        if (!response.ok) {
+          setStatus((payload && payload.error) || "Читатель Directum не запустился", true);
+          return;
+        }
+        if (payload.packets && payload.packets.length) {
+          showPacket("packet-directum", formatInbox(payload.packets[payload.packets.length - 1]), true);
+        }
+        await refresh();
+        const after = await fetch("/api/snapshot", { cache: "no-store" }).then((response) => response.json());
+        const topicAfter = ((after.topics || {})["crm.account.upserted.v1"] || {}).count || 0;
+        const errorsAfter = ((after.topics || {})["dlq.directum.account"] || {}).count || 0;
+        if (topicAfter !== topicBefore) {
+          setStatus("В топике стало больше сообщений. Так быть не должно.", true);
+          return;
+        }
+        if (errorsAfter !== errorsBefore + 1) {
+          setStatus("Для Directum новых сообщений нет. Сначала положите карточку в топик.", true);
+          return;
+        }
+        if ((after.directum || []).length > (before.directum || []).length) {
+          setStatus("Directum записал карточку, хотя был недоступен.", true);
+          return;
+        }
+        setStatus("Directum был недоступен. Новое сообщение в топик не клалось. То же сообщение лежит в «Ошибки Directum», карточка в Directum не появилась.");
+      });
+    };
+    document.querySelector("#clear").onclick = async () => {
+      if (!confirm("Очистить стенд: карточки Creatio, SAP и Directum, сообщения в топиках и логи контейнеров?")) return;
+      const buttons = document.querySelectorAll("button");
+      buttons.forEach((button) => { button.disabled = true; });
+      setStatus("Очищаю эмуляторы, топики и логи...");
+      try {
+        const response = await fetch("/api/clear", { method: "POST" });
+        const payload = await response.json();
+        if (!response.ok) {
+          setStatus("Ошибка очистки: " + (payload.errors ? payload.errors.join("; ") : payload.status), true);
+          return;
+        }
+        idEl.textContent = "—";
+        document.querySelector("#code").value = "";
+        setStatus("Всё очищено. Можно начинать заново.");
+        await refresh();
+      } catch (error) {
+        setStatus(String(error), true);
+      } finally {
+        buttons.forEach((button) => { button.disabled = false; });
+      }
+    };
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

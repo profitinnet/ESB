@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Интеграционная шина — пилот контрагента</title>
+<style>
+  @page { size: A4; margin: 16mm 16mm 18mm; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    color: #1c1c1c;
+    font-family: "Segoe UI", Calibri, sans-serif;
+    font-size: 11pt;
+    line-height: 1.45;
+  }
+  h1 { font-size: 20pt; font-weight: 650; margin: 0 0 6px; letter-spacing: -0.02em; }
+  h2 { font-size: 14pt; margin: 22px 0 8px; page-break-after: avoid; }
+  h3 { font-size: 12pt; margin: 14px 0 6px; page-break-after: avoid; }
+  p { margin: 0 0 8px; }
+  .meta { color: #444; font-size: 10pt; margin-bottom: 14px; }
+  .note {
+    border-left: 3px solid #1f4b8f;
+    padding: 8px 12px;
+    margin: 10px 0 14px;
+    background: #f4f7fb;
+    page-break-inside: avoid;
+  }
+  table { width: 100%; border-collapse: collapse; margin: 8px 0 12px; page-break-inside: avoid; }
+  th, td { border: 1px solid #c8c8c8; padding: 5px 7px; vertical-align: top; text-align: left; }
+  th { background: #eef2f6; font-weight: 650; }
+  ul { margin: 6px 0 10px; padding-left: 18px; }
+  li { margin: 0 0 4px; }
+  code { font-family: Consolas, "Courier New", monospace; font-size: 10pt; }
+  .small { font-size: 10pt; color: #333; }
+  .flow {
+    border: 1px solid #c8c8c8;
+    padding: 8px 12px;
+    margin: 8px 0 12px;
+    page-break-inside: avoid;
+    background: #fafafa;
+  }
+</style>
+</head>
+<body>
+
+<h1>Интеграционная шина. Пилот: контрагент</h1>
+<p class="meta">План работ, не отчёт о уже сделанных маршрутах. 5 октября 2026. Сервер dwh-proc01. Прежний первый этап с EDIN, Вчасно и 1С этим пилотом заменяется.</p>
+
+<div class="note">
+  <strong>Слова на этой странице.</strong>
+  Брокер — программа, которая хранит сообщения. Здесь это Redpanda.
+  Топик — лента сообщений одного вида внутри брокера.
+  Эмулятор — учебная программа с теми же запросами, что у настоящей системы.
+  DLQ — отдельная лента для сообщений, которые не удалось обработать.
+  Золотая запись — единственное место, где контрагента создают и меняют. Здесь это Creatio.
+  Service Layer — штатный сетевой вход SAP Business One.
+</div>
+
+<h2>1. Что делаем</h2>
+<p>Целевая схема ландшафта остаётся действительной. Creatio на ней — блок CRM. Directum — блок процессов и документов. SAP Business One — блок ERP. Стек тот же: брокер Redpanda, маршруты пишет Camel. Kafka на порту 9094 в пилот не входит. Почему: одни и те же события не должны разъехаться по двум хранилищам.</p>
+<p>Creatio — золотая запись. Шина не сводит три копии в одну. Она забирает факт «контрагента создали или изменили» и доставляет его в Directum и в SAP. У каждого приёмника свой набор полей. Почему: SAP и Directum не обязаны хранить карточку Creatio целиком.</p>
+
+<h2>2. Как идёт сообщение</h2>
+<div class="flow">
+  <p>Эмулятор Creatio сохраняет контрагента и сразу вызывает вход шины. Это повтор результата бизнес-процесса Creatio: карточка сохранена, и Creatio сама обращается к внешнему адресу. В документации webhook Creatio устроен наоборот: чужая система вызывает Creatio. Поэтому эмулятор повторяет выход, а не приём чужого вызова.</p>
+  <p>Camel кладёт одно сообщение в Redpanda, в ленту <code>crm.account.upserted.v1</code>.</p>
+  <p>Эту ленту читают две отдельные программы-читатели. Одна вызывает SAP. Вторая вызывает Directum.</p>
+  <p>Если Directum ответил ошибкой, сообщение лежит в <code>dlq.directum.account</code>. Запись в SAP при этом остаётся. Если ошибся SAP, сообщение лежит в <code>dlq.sap.account</code>, а Directum не откатывается.</p>
+</div>
+<p>Почему два читателя, а не один маршрут на оба вызова: повтор после ошибки касается только того приёмника, который не принял запись. Успешный вызов второй раз не выполняется.</p>
+<p>В ленте лежит оболочка сообщения. <code>subject</code> — идентификатор контрагента Creatio. <code>correlationid</code> — номер этой цепочки. Тело — поля золотой записи, не готовый запрос SAP и не готовый запрос Directum. Преобразование делает Camel. Почему: иначе Creatio пришлось бы знать устройство обоих приёмников.</p>
+
+<h2>3. Что на сервере не трогаем</h2>
+<p>Новый набор контейнеров называется ibus. Его подключаем к уже существующей сети Redpanda. Camel обращается к имени <code>redpanda</code> и порту 9092 внутри этой сети. Почему: адрес <code>localhost:19092</code> внутри другого контейнера указывает на него самого, а не на Redpanda.</p>
+<p>Учебный Camel на порту 8880, учебная лента <code>orders</code> и чужие контейнеры не меняем. Свой Camel пилота слушает другой порт. Почему: 8880 уже занят учебной проверкой.</p>
+
+<h2>4. Контракты по документации</h2>
+<p>Creatio. Объект контрагента называется Account. Пример полей и чтение по OData 4: <span class="small">academy.creatio.com, руководство OAuth и OData 4</span>. Боевой адрес чтения выглядит как <code>/0/odata/Account</code>. В базовом примере есть <code>Id</code>, <code>Name</code>, <code>Code</code>, <code>Phone</code>, <code>Web</code>, <code>Address</code>, <code>Zip</code>, <code>Notes</code>, <code>AlternativeName</code>, <code>ModifiedOn</code>. Отдельного ИНН в этом примере нет. В эмуляторе добавляем поле <code>TaxId</code> и помечаем его как локальное, не как стандартную колонку. Почему: SAP кладёт налоговый номер в <code>FederalTaxID</code>, Directum — в <code>TIN</code>, а без этого поля приёмники получают только название.</p>
+<p>SAP Business One. Сначала вход <code>POST /b1s/v1/Login</code>, в ответе признак сессии. Создание: <code>POST /b1s/v1/BusinessPartners</code>, ответ 201. Изменение: <code>PATCH /b1s/v1/BusinessPartners('CardCode')</code>, ответ 204 без тела. Повторное создание того же кода даёт ошибку 400 с кодом −10. Описание: документ SAP «Working with SAP Business One Service Layer».</p>
+<p>Directum RX. SQL Server у него может быть базой, на которой стоит система. Документированный приём контрагента — не запись в таблицы, а сервис интеграции: <code>POST /Integration/odata/ICompanies</code>. Обязательное поле — <code>Name</code>. Описание: справка Directum RX «Как синхронизировать контрагентов». Почему не прямой SQL в пилоте: запись в таблицы обходит проверки Directum, в том числе поиск дубля по налоговому номеру. Эмулятор отвечает по HTTP, как этот сервис. Если позже подтвердится старый Directum, не RX, меняется только этот приёмник, не шина.</p>
+
+<h2>5. Какие поля куда попадают</h2>
+<table>
+  <tr><th>Creatio, золотая запись</th><th>SAP Business One</th><th>Directum RX</th></tr>
+  <tr><td>Id, ключ карточки</td><td>Не пишется в карточку. По Code, а если его нет — по короткой форме Id, берётся CardCode</td><td>Свой числовой Id выдаёт Directum. Эмулятор помнит связь «Id Creatio → Id Directum»</td></tr>
+  <tr><td>Name</td><td>CardName</td><td>Name, поле обязательное</td></tr>
+  <tr><td>Phone</td><td>Phone1</td><td>Phone</td></tr>
+  <tr><td>Web</td><td>Website</td><td>не передаём в этом пилоте</td></tr>
+  <tr><td>Address и Zip</td><td>Адрес счёта, тип bo_BillTo</td><td>LegalAddress</td></tr>
+  <tr><td>TaxId, локальное поле</td><td>FederalTaxID</td><td>TIN</td></tr>
+  <tr><td>тип в пилоте не различаем</td><td>Всегда cCustomer, то есть клиент</td><td>организация ICompanies</td></tr>
+</table>
+<p>Почему SAP всегда клиент: первый сценарий — контрагент из CRM, не поставщик. Смена типа — отдельное решение.</p>
+<p>Повтор того же Id Creatio обновляет уже созданные записи. SAP — через изменение. Directum — через изменение найденной организации. Второй контрагент не создаётся. Это относится и к созданию, и к изменению: эмулятор срабатывает на сохранение карточки в обоих случаях.</p>
+
+<h2>6. Эмуляторы</h2>
+<p>Три небольших сетевых службы. Память только на время контейнера.</p>
+<ul>
+  <li>Creatio: сохранить контрагента и сразу вызвать вход шины. В теле те же имена полей, что у Account, плюс TaxId.</li>
+  <li>SAP B1: вход, создание и изменение контрагента, ошибка −10 при повторном создании того же кода, ошибка проверки, если нет названия.</li>
+  <li>Directum RX: создание и изменение организации, без названия отвечает ошибкой, помнит связь с Id Creatio.</li>
+</ul>
+
+<h2>7. Что появится в проекте</h2>
+<p>Исходники остаются в проекте на этом компьютере. На сервер, в каталог /opt/ibus, копируется только запуск.</p>
+<ul>
+  <li>contracts/ — пример сообщения ленты, пример тела SAP и пример тела Directum.</li>
+  <li>emulators/ — три службы.</li>
+  <li>camel/routes/ — вход от Creatio и два читателя Redpanda.</li>
+  <li>compose/docker-compose.yml — подключение к сети Redpanda, свой порт Camel.</li>
+</ul>
+
+<h2>8. Когда пилот считаем готовым</h2>
+<ul>
+  <li>Новый контрагент в эмуляторе Creatio появляется и в SAP, и в Directum. В ленте одно сообщение.</li>
+  <li>Изменение имени в Creatio меняет ту же запись SAP и ту же организацию Directum.</li>
+  <li>Повтор того же Id не создаёт вторую карточку.</li>
+  <li>Если Directum отвечает ошибкой, сообщение лежит в его ленте ошибок, а запись в SAP остаётся. Следующий контрагент проходит в обе системы.</li>
+  <li>В Kafka на порту 9094 новых лент нет. Учебные hello и orders на месте.</li>
+</ul>
+
+<p class="small">Вне пилота: помощник на базе ИИ, дашборды, боевые адреса, прямая запись в базу Directum, EDIN и Вчасно.</p>
+
+</body>
+</html>

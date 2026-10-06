@@ -1,0 +1,23 @@
+{
+  "specversion": "1.0",
+  "id": "6f1c0c3e-7b2a-4e5d-9a11-0c5d2e8a1001",
+  "source": "creatio/accounts",
+  "type": "com.company.crm.account.upserted",
+  "time": "2026-10-05T15:00:00Z",
+  "subject": "405947d0-2ffb-4ded-8675-0475f19f5a81",
+  "correlationid": "6f1c0c3e-7b2a-4e5d-9a11-0c5d2e8a1001",
+  "datacontenttype": "application/json",
+  "data": {
+    "Id": "405947d0-2ffb-4ded-8675-0475f19f5a81",
+    "Name": "Accom (sample)",
+    "Code": "ACCOM",
+    "Phone": "+380441112233",
+    "Web": "https://accom.example",
+    "Address": "Khreshchatyk 1",
+    "Zip": "01001",
+    "Notes": "",
+    "AlternativeName": "Accom LLC",
+    "ModifiedOn": "2026-10-05T15:00:00Z",
+    "TaxId": "12345678"
+  }
+}

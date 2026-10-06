@@ -1,0 +1,17 @@
+{
+  "CardCode": "ACCOM",
+  "CardName": "Accom (sample)",
+  "CardType": "cCustomer",
+  "Phone1": "+380441112233",
+  "Website": "https://accom.example",
+  "FederalTaxID": "12345678",
+  "BPAddresses": [
+    {
+      "AddressName": "Bill",
+      "Street": "Khreshchatyk 1",
+      "ZipCode": "01001",
+      "AddressType": "bo_BillTo",
+      "BPCode": "ACCOM"
+    }
+  ]
+}
