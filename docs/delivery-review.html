@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Как обеспечивается доставка сообщений — ESB</title>
+<style>
+:root{--bg:#f3f1eb;--paper:#fffefa;--ink:#24352e;--muted:#65716b;--line:#dce0d8;--green:#27664d;--blue:#345e8a;--amber:#815e20}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 "Segoe UI",Arial,sans-serif}
+main{max-width:960px;margin:auto;padding:48px 32px 64px}
+header{padding-bottom:24px}
+.eyebrow{color:var(--green);font-size:12px;font-weight:700;letter-spacing:.11em;text-transform:uppercase}
+h1{font-size:clamp(30px,5vw,48px);line-height:1.13;letter-spacing:-.035em;margin:16px 0;font-weight:650}
+h2{font-size:25px;line-height:1.3;letter-spacing:-.025em;margin:0 0 14px}
+h3{font-size:18px;line-height:1.4;margin:0 0 8px}
+p{margin:0 0 14px}
+a{color:var(--blue);text-underline-offset:3px;overflow-wrap:anywhere}
+a:hover{color:var(--green)}
+a:focus-visible,summary:focus-visible{outline:3px solid var(--blue);outline-offset:4px}
+code{background:#edf0e9;border-radius:5px;padding:2px 5px;font:.87em/1.5 Consolas,monospace;overflow-wrap:anywhere}
+.lead{font-size:20px;line-height:1.55}
+.meta,.source{color:var(--muted);font-size:13px}
+.tag{display:inline-block;background:var(--paper);border:1px solid var(--line);border-radius:20px;padding:3px 10px;font-size:12px;font-weight:600;margin:0 6px 8px 0}
+.panel{padding:28px;background:var(--paper);border:1px solid var(--line);border-radius:18px;margin-bottom:22px}
+.panel>p:last-child{margin-bottom:0}
+.verdict{border-left:5px solid var(--green);background:#e9f3ed}
+.verdict strong{display:block;font-size:21px;line-height:1.45;margin-bottom:8px}
+.diagram{padding:24px;margin:20px 0;background:#f5f7f2;border-radius:14px}
+.track{display:grid;grid-template-columns:minmax(0,1fr) 28px minmax(0,1fr) 28px minmax(0,1fr);gap:8px;align-items:center}
+.node{min-width:0;padding:16px 12px;border:1px solid #c8d7e8;border-radius:12px;text-align:center;background:#edf3fb;color:var(--blue)}
+.node strong,.node span{display:block}
+.node strong{line-height:1.4}
+.node span{font-size:13px;line-height:1.45;margin-top:5px}
+.node.storage{background:#fbf1dd;border-color:#e0cfab;color:var(--amber)}
+.node.receiver{background:#e9f3ed;border-color:#bed6c8;color:var(--green)}
+.arrow{font-size:24px;color:#7b8b80;text-align:center}
+.down{text-align:center;color:var(--muted);font-size:13px;margin:10px 0}
+.down b{display:block;font-size:22px;line-height:1.2;color:#7b8b80}
+.branches{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.state{max-width:400px;margin:auto}
+.steps{list-style:none;counter-reset:steps;margin:20px 0 0;padding:0}
+.steps li{counter-increment:steps;position:relative;padding:0 0 24px 52px}
+.steps li:last-child{padding-bottom:0}
+.steps li::before{content:counter(steps);position:absolute;left:0;top:0;width:32px;height:32px;display:grid;place-items:center;border:1px solid #bed2c3;background:#e9f3ed;color:var(--green);border-radius:50%;font-weight:700}
+.steps p:last-child{margin-bottom:0}
+.order{margin:12px 0;padding:15px 18px;border-radius:10px;background:#e9f3ed;color:var(--green);font-weight:600}
+.table-scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;margin:16px 0;font-size:15px}
+th,td{padding:12px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-size:12px;background:#f5f7f2}
+td:first-child{width:34%;font-weight:600}
+details{border-top:1px solid var(--line);padding:16px 0}
+details:last-child{padding-bottom:0}
+summary{cursor:pointer;font-weight:650;line-height:1.5}
+.finding{padding:14px 0 0 20px}
+.finding p:last-child{margin-bottom:0}
+.status-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin:18px 0}
+.status-card{background:#f5f7f2;padding:20px;border-radius:12px}
+.status-card h3{color:var(--green)}
+.status-card.planned h3{color:var(--amber)}
+ul{padding-left:20px;margin:10px 0}
+li{margin-bottom:6px}
+.next{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+.next .eyebrow{color:#acd4bc}
+.next h2{margin:10px 0 14px}
+.next p{color:#e0e8df}
+footer{font-size:13px;color:var(--muted);padding:0 4px}
+@media(max-width:620px){body{font-size:15px}main{padding:28px 16px 40px}.panel{padding:20px;border-radius:14px}.lead{font-size:18px}.diagram{padding:16px}.track{grid-template-columns:1fr;gap:5px}.track .arrow{transform:rotate(90deg);height:25px;line-height:25px}.status-grid{grid-template-columns:1fr}.branches{gap:10px}.node{padding:14px 8px}.steps li{padding-left:43px}th,td{padding:10px 8px}}
+@media print{body{background:white;font-size:11pt}main{max-width:none;padding:0}h1{font-size:28pt}.panel{padding:18px;border-radius:8px}.diagram,.status-card,.order,details{break-inside:avoid}h2,h3,summary{break-after:avoid}a{color:inherit}.next{background:white;color:var(--ink)}.next p,.next .eyebrow{color:var(--ink)}}
+</style>
+</head>
+<body>
+<main>
+<header>
+<div class="eyebrow">ESB · Пилот контрагента · 7 октября 2026</div>
+<h1>Как обеспечивается доставка сообщений</h1>
+<p class="lead">Путь сообщения, защита от сбоев и границы текущей гарантии — простыми словами.</p>
+<div><span class="tag">GitLab: main</span><span class="tag">Коммит c049cb3</span><span class="tag">Разбор кода и документации</span></div>
+<p class="meta">Получены актуальные ссылки из GitLab; выполнено обновление ветки без расхождения истории. Локальная main уже совпадала с gitlab/main, поэтому новых изменений нет. Локальные файлы сохранены, ничего не отправлено. Аварийные испытания работающего сервера не проводились.</p>
+</header>
+
+<section class="panel verdict" aria-label="Главный вывод">
+<strong>Подтверждения, повторы и запоминание доставленной версии уже есть.</strong>
+<p>Полная гарантия от сохранения карточки в Creatio до её применения в обеих системах пока не обеспечена. Подтверждение брокера и успешная запись у получателя — разные этапы.</p>
+</section>
+
+<section class="panel">
+<h2>Путь одного сообщения</h2>
+<p>Creatio хранит исходную карточку. Camel преобразует и передаёт данные. Redpanda — брокер, то есть программа хранения сообщений. PostgreSQL запоминает, какую версию уже получила каждая система.</p>
+<div class="diagram" role="img" aria-label="Creatio передаёт карточку во вход Camel, Camel сохраняет событие в Redpanda. Два независимых читателя доставляют его в SAP и Directum и учитывают доставленную версию в PostgreSQL.">
+<div class="track">
+<div class="node"><strong>Creatio</strong><span>Исходная карточка</span></div>
+<div class="arrow" aria-hidden="true">→</div>
+<div class="node"><strong>Camel</strong><span>Приём события</span></div>
+<div class="arrow" aria-hidden="true">→</div>
+<div class="node storage"><strong>Redpanda</strong><span>Хранение сообщения</span></div>
+</div>
+<div class="down"><b aria-hidden="true">↓</b>Два независимых читателя</div>
+<div class="branches">
+<div class="node receiver"><strong>Camel → SAP</strong><span>Своя позиция чтения</span></div>
+<div class="node receiver"><strong>Camel → Directum</strong><span>Своя позиция чтения</span></div>
+</div>
+<div class="down"><b aria-hidden="true">↓</b>Учёт версии отдельно для каждого получателя</div>
+<div class="node storage state"><strong>PostgreSQL</strong><span>Последняя применённая версия</span></div>
+</div>
+<p class="meta">При ошибке Directum успешная запись SAP остаётся. Между двумя получателями нет общего отката.</p>
+
+<ol class="steps">
+<li>
+<h3>Создать событие</h3>
+<p>После сохранения карточки Camel собирает сообщение с полями Creatio. Идентификатор события — <code>Id:ModifiedOn</code>, то есть номер карточки и время изменения. В интерфейсе стенда сохранение и отправка специально разделены кнопками.</p>
+<p class="source"><a href="../stand/app.py">stand/app.py, строки 284–302</a></p>
+</li>
+<li>
+<h3>Получить подтверждение брокера</h3>
+<p>Camel отправляет сообщение в ленту <code>crm.account.upserted.v1</code>, ждёт подтверждения и только после этого отвечает <code>202</code>. Это означает «сообщение принято брокером».</p>
+<p><code>enableIdempotence</code> защищает от дублей при внутренних повторах отправителя. Повторный HTTP-вызов может создать ещё одну запись в ленте.</p>
+<p class="source"><a href="../camel/routes/ingress.camel.yaml">ingress.camel.yaml, строки 79–96</a> · <a href="https://kafka.apache.org/40/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html">Официальное пояснение Kafka</a></p>
+</li>
+<li>
+<h3>Доставить каждому получателю независимо</h3>
+<p>SAP и Directum читают одну ленту под разными именами групп. Перед вызовом системы Camel проверяет в PostgreSQL последнюю применённую версию. Равную или более старую версию пропускает.</p>
+<p>Проект синхронизирует последнее состояние карточки и может пропускать промежуточные обновления.</p>
+<p class="source"><a href="../camel/routes/delivery.camel.yaml">delivery.camel.yaml, строки 46–71</a></p>
+</li>
+<li>
+<h3>Подтвердить обработку после результата</h3>
+<div class="order">Ответ получателя об успехе → запись версии в PostgreSQL → подтверждение обработки брокеру</div>
+<p>Подтверждение обработки называется <em>commit</em>: оно сохраняет позицию, с которой читатель продолжит после перезапуска. Автоматическое подтверждение отключено.</p>
+<p>Именно этот порядок защищает от преждевременного «забывания» сообщения.</p>
+<p class="source"><a href="../camel/routes/sap-account.camel.yaml">sap-account.camel.yaml, строки 383–386</a> · <a href="../camel/routes/directum-account.camel.yaml">directum-account.camel.yaml, строки 361–364</a> · <a href="https://camel.apache.org/components/4.22.x/kafka-component.html">Ручные подтверждения в Camel</a></p>
+</li>
+</ol>
+</section>
+
+<section class="panel">
+<h2>Что происходит при ошибке</h2>
+<div class="table-scroll">
+<table>
+<thead><tr><th scope="col">Ситуация</th><th scope="col">Действие кода</th></tr></thead>
+<tbody>
+<tr><td>Получатель недоступен, отвечает 429 или 5xx</td><td>Повторяет запрос с паузами до пяти секунд. Обработку не подтверждает.</td></tr>
+<tr><td>Получатель отклонил данные</td><td>Сохраняет исходное сообщение в отдельную ленту ошибок — <strong>DLQ</strong>, затем подтверждает исходную обработку.</td></tr>
+<tr><td>Версия уже применена</td><td>Пропускает повтор и подтверждает обработку.</td></tr>
+<tr><td>Нужен повтор из DLQ</td><td>Копирует сообщение в отдельную ленту повторной доставки для этого получателя.</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Попадание в DLQ означает «ошибка сохранена». Доставка в систему ещё не завершена.</strong></p>
+<p class="source">Обработка ошибок: <a href="../camel/routes/sap-account.camel.yaml">sap-account.camel.yaml</a> и <a href="../camel/routes/directum-account.camel.yaml">directum-account.camel.yaml</a>. Ручной повтор: <a href="../stand/app.py">stand/app.py, строки 408–429</a>.</p>
+</section>
+
+<section class="panel">
+<h2>Где гарантия пока прерывается</h2>
+<p class="meta">Десять конкретных ограничений. Каждый пункт содержит причину, последствия и файл.</p>
+
+<details open><summary>01 · Событие может не попасть в брокер</summary><div class="finding">
+<p>Карточка сохраняется раньше отправки. После шести неудачных попыток постоянного списка неотправленных событий нет.</p>
+<p><strong>Последствие:</strong> карточка есть в Creatio, но SAP и Directum о ней не узнают без новой ручной отправки.</p>
+<p class="source"><a href="../emulators/app.py">emulators/app.py, строки 203–210 и 492–516</a></p>
+</div></details>
+
+<details open><summary>02 · Получатель записал данные, но Camel не узнал об этом</summary><div class="finding">
+<p>HTTP-вызов и запись результата в PostgreSQL выполняются раздельно.</p>
+<p><strong>Последствие:</strong> потеря ответа или падение Camel приводит к повторному запросу. При повторном создании возможен конфликт, который код отправит в DLQ.</p>
+<p class="source"><a href="../camel/routes/directum-account.camel.yaml">directum-account.camel.yaml, строки 354–364</a>; аналогичная граница есть в <a href="../camel/routes/sap-account.camel.yaml">sap-account.camel.yaml</a>.</p>
+</div></details>
+
+<details open><summary>03 · Старое обновление может затереть новое</summary><div class="finding">
+<p>Обычный маршрут и маршрут повторов работают отдельно. Проверка версии, HTTP-вызов и обновление таблицы не защищены общей блокировкой.</p>
+<p><strong>Последствие:</strong> оба маршрута могут пройти проверку одновременно, а старый закончить последним и вернуть карточку к прошлому состоянию.</p>
+<p class="source"><a href="../camel/routes/delivery.camel.yaml">delivery.camel.yaml, строки 46 и 95</a> · <a href="../camel/routes/control.camel.yaml">control.camel.yaml, строки 20–30</a></p>
+</div></details>
+
+<details open><summary>04 · Версии сравниваются как текст</summary><div class="finding">
+<p>После <code>12:00:00Z</code> версия <code>12:00:00.100Z</code> может быть пропущена, хотя она новее. Текстовое сравнение ставит эти значения в неверном порядке.</p>
+<p><strong>Последствие:</strong> настоящее обновление теряется при проверке версии. Два сохранения в одну миллисекунду также могут получить одинаковую версию.</p>
+<p class="source"><a href="../camel/routes/delivery.camel.yaml">delivery.camel.yaml, строка 68</a> · <a href="../emulators/app.py">emulators/app.py, строки 37–39</a>. Пример сравнения проверен отдельно в памяти, без обращения к сервисам.</p>
+</div></details>
+
+<details open><summary>05 · Неверный JSON может остановить читателя</summary><div class="finding">
+<p>Разбор сообщения происходит под обработчиком с бесконечными повторами, до отправки непригодного события в DLQ.</p>
+<p><strong>Последствие:</strong> читатель бесконечно повторяет заведомо неразбираемое сообщение; следующие события ждут.</p>
+<p class="source"><a href="../camel/routes/sap-account.camel.yaml">sap-account.camel.yaml, строки 135–165</a> · <a href="../camel/routes/directum-account.camel.yaml">directum-account.camel.yaml, строки 135–165</a></p>
+</div></details>
+
+<details open><summary>06 · Коды ответов классифицируются слишком широко</summary><div class="finding">
+<p><code>3xx</code> считается успехом, а <code>401/403</code> — ошибкой данных.</p>
+<p><strong>Последствие:</strong> перенаправление может привести к ложному подтверждению доставки. Ошибка доступа требует исправления подключения, но выглядит как проблема карточки.</p>
+<p class="source"><a href="../camel/routes/directum-account.camel.yaml">directum-account.camel.yaml, строки 90–96</a>; аналогичная логика есть в <a href="../camel/routes/sap-account.camel.yaml">sap-account.camel.yaml, строки 90–96</a>.</p>
+</div></details>
+
+<details open><summary>07 · Сохранность после поломки не обеспечена конфигурацией проекта</summary><div class="finding">
+<p>При пересоздании топиков задаётся одна копия. Эмуляторы хранят карточки в памяти. Настройки хранения внешней Redpanda здесь не описаны.</p>
+<p><strong>Последствие:</strong> потеря единственного диска угрожает сообщениям. Перезапуск эмулятора стирает карточки, хотя PostgreSQL продолжает считать версии доставленными.</p>
+<p class="source"><a href="../stand/app.py">stand/app.py, строка 598</a> · <a href="../emulators/app.py">emulators/app.py, строки 24–29</a></p>
+</div></details>
+
+<details open><summary>08 · Управление стендом доступно без проверки пользователя</summary><div class="finding">
+<p>Порт <code>8894</code> опубликован на всех интерфейсах. Вызов <code>/api/clear</code> удаляет карточки, топики и таблицу версий. Учебные пароли записаны в конфигурации, соединения используют обычный HTTP.</p>
+<p><strong>Последствие:</strong> любой, кто имеет сетевой доступ к порту, может удалить ожидающие сообщения.</p>
+<p class="source"><a href="../compose/docker-compose.yml">docker-compose.yml, строки 43–45 и 71</a> · <a href="../stand/app.py">stand/app.py, строки 249–253 и 441–472</a> · <a href="../camel/routes/delivery.camel.yaml">delivery.camel.yaml, строки 7–9</a></p>
+</div></details>
+
+<details open><summary>09 · Данные могут попасть в чужую карточку SAP</summary><div class="finding">
+<p>Код SAP обрезается до 15 символов. Постоянной связи с идентификатором Creatio нет.</p>
+<p><strong>Последствие:</strong> разные длинные коды с одинаковым началом превращаются в один <code>CardCode</code>. Например, <code>ABCDEFGHIJKLMNO1</code> и <code>ABCDEFGHIJKLMNO2</code>. Смена кода может создать вторую карточку.</p>
+<p class="source"><a href="../camel/routes/sap-account.camel.yaml">sap-account.camel.yaml, строки 175–184</a></p>
+</div></details>
+
+<details open><summary>10 · Стенд может показать ложный успех</summary><div class="finding">
+<p>Статус <code>delivered</code> определяется по появлению запроса во входном списке. Запрос записывается туда до проверки результата.</p>
+<p><strong>Последствие:</strong> надпись «доставлено» ещё не доказывает успешное применение карточки.</p>
+<p class="source"><a href="../stand/app.py">stand/app.py, строки 335–352</a> · <a href="../emulators/app.py">emulators/app.py, строка 387</a></p>
+</div></details>
+</section>
+
+<section class="panel">
+<h2>Что реализовано, а что остаётся планом</h2>
+<div class="status-grid">
+<div class="status-card"><h3>Уже есть в коде</h3><ul>
+<li>Три эмулятора: Creatio, SAP и Directum.</li>
+<li>Независимая доставка двум получателям.</li>
+<li>Ручные подтверждения обработки.</li>
+<li>PostgreSQL с последней доставленной версией.</li>
+<li>Списки ошибок и ручной повтор.</li>
+</ul></div>
+<div class="status-card planned"><h3>Пока только описано</h3><ul>
+<li>Обмен с 1С, EDIN и Вчасно.</li>
+<li>Наблюдение, помощник и резервное восстановление.</li>
+<li>Три боевых узла.</li>
+<li>Отдельный сервер наблюдения.</li>
+<li>Защищённый вход и внешнее хранение секретов.</li>
+</ul></div>
+</div>
+<p>Читатели запускаются кнопками и автоматически после перезапуска Camel не включаются. Это режим демонстрационного стенда.</p>
+<p>Пилот контрагента заменяет прежний первый этап: <a href="counterparty-pilot.pdf">описание пилота</a>. Старые потоки и полный MVP описаны в <a href="phase-1-plan.pdf">плане первого этапа</a> и <a href="mvp-plan.pdf">плане MVP</a>.</p>
+<p>Три боевых узла, отдельный сервер наблюдения и защищённый вход описаны в <a href="platform-proposal.pdf">локальном предложении по платформе</a>. Этот документ на момент проверки не отслеживается Git и отсутствует в <code>gitlab/main</code>.</p>
+<p class="source">Все четыре PDF прочитаны. Их текст соответствует HTML-версиям; дополнительных архитектурных положений в PDF не обнаружено.</p>
+</section>
+
+<section class="panel">
+<h2>Как это устроено у аналогов</h2>
+<p>Сравнение по официальной документации. Во всех вариантах важны подтверждения и безопасная повторная обработка у получателя.</p>
+<div class="table-scroll"><table>
+<thead><tr><th scope="col">Аналог</th><th scope="col">Как обеспечивается надёжность</th></tr></thead>
+<tbody>
+<tr><td>Kafka + Camel</td><td>Подтверждения и повторная обработка. Для внешней системы нужно согласовать запись результата с позицией читателя. Это как раз незакрытая граница проекта. <a href="https://kafka.apache.org/40/design/design/">Apache Kafka</a>.</td></tr>
+<tr><td>RabbitMQ</td><td>Отдельные подтверждения от брокера и потребителя. Повторы допустимы; получатель должен безопасно обрабатывать их. <a href="https://www.rabbitmq.com/docs/reliability">RabbitMQ</a>.</td></tr>
+<tr><td>Redpanda Connect</td><td>Подтверждает вход после подтверждения выхода. Гарантия зависит от свойств подключённых источников и получателей. Повторы возможны. <a href="https://docs.redpanda.com/redpanda-connect/guides/delivery_semantics/">Redpanda Connect</a>.</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<section class="panel next">
+<div class="eyebrow">Один главный следующий шаг</div>
+<h2>Постоянный журнал исходящих событий у источника</h2>
+<p>Такой механизм называют <strong>transactional outbox</strong>. Карточка и событие должны сохраняться одной транзакцией, а отдельный отправитель — повторять передачу до подтверждения брокера.</p>
+<p>Это закроет первый разрыв: сохранённое изменение Creatio перестанет зависеть от успешности HTTP-вызова в момент сохранения.</p>
+</section>
+<footer>Разбор проекта D:\AI\ESB · GitLab main · c049cb3 · Самодостаточный HTML без внешних шрифтов, скриптов и изображений.</footer>
+</main>
+</body>
+</html>
