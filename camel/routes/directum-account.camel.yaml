@@ -1,0 +1,364 @@
+- route:
+    id: directum-account
+    autoStartup: false
+    from:
+      uri: kafka:crm.account.upserted.v1
+      parameters:
+        brokers: redpanda:9092
+        groupId: ibus-directum
+        autoOffsetReset: earliest
+        autoCommitEnable: false
+        allowManualCommit: true
+        breakOnFirstError: true
+        maxPollRecords: 1
+        maxPollIntervalMs: 3600000
+        sessionTimeoutMs: 10000
+        heartbeatIntervalMs: 3000
+      steps:
+        - setProperty:
+            name: system
+            constant: directum
+        - to: direct:capture-kafka
+        - to: direct:directum-apply
+
+- route:
+    id: directum-account-replay
+    autoStartup: false
+    from:
+      uri: kafka:replay.directum.account
+      parameters:
+        brokers: redpanda:9092
+        groupId: ibus-directum-replay
+        autoOffsetReset: earliest
+        autoCommitEnable: false
+        allowManualCommit: true
+        breakOnFirstError: true
+        maxPollRecords: 1
+        maxPollIntervalMs: 3600000
+        sessionTimeoutMs: 10000
+        heartbeatIntervalMs: 3000
+      steps:
+        - setProperty:
+            name: system
+            constant: directum
+        - to: direct:capture-kafka
+        - to: direct:directum-apply
+
+- route:
+    id: directum-dlq
+    errorHandler:
+      noErrorHandler: {}
+    from:
+      uri: direct:directum-dlq
+      steps:
+        - setBody:
+            simple: ${exchangeProperty.rawEvent}
+        - removeHeaders:
+            pattern: ".*"
+        - setHeader:
+            name: kafka.KEY
+            simple: ${exchangeProperty.entityId}
+        - convertBodyTo:
+            type: byte[]
+        - to:
+            uri: kafka:dlq.directum.account
+            parameters:
+              brokers: redpanda:9092
+              requestRequiredAcks: all
+              enableIdempotence: true
+              retries: 10
+        - to: direct:kafka-commit
+
+- route:
+    id: directum-after-http
+    errorHandler:
+      noErrorHandler: {}
+    from:
+      uri: direct:directum-after-http
+      steps:
+        - setProperty:
+            name: httpResult
+            groovy: |
+              def code = exchange.getMessage().getHeader('CamelHttpResponseCode')
+              int status = 0
+              if (code instanceof Number) {
+                status = code.intValue()
+              } else if (code != null && code.toString().trim()) {
+                status = Integer.parseInt(code.toString())
+              }
+              exchange.setProperty('httpCode', status)
+              if (status == 429 || status >= 500 || status == 0) {
+                return 'transient'
+              }
+              if (status >= 400) {
+                return 'data'
+              }
+              return 'ok'
+        - choice:
+            when:
+              - simple: "${exchangeProperty.httpResult} == 'transient'"
+                steps:
+                  - setProperty:
+                      name: retryHttp
+                      groovy: |
+                        int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
+                        long pause = Math.min(1000L << Math.min(n, 3), 5000L)
+                        exchange.setProperty('tries', n + 1)
+                        Thread.sleep(pause)
+                        return 'yes'
+              - simple: "${exchangeProperty.httpResult} == 'data'"
+                steps:
+                  - log:
+                      message: "ошибка данных: system=directum entity=${exchangeProperty.entityId} http=${exchangeProperty.httpCode}"
+                  - to: direct:directum-dlq
+                  - setProperty:
+                      name: finished
+                      constant: "yes"
+                  - setProperty:
+                      name: retryHttp
+                      constant: "no"
+                  - setProperty:
+                      name: tries
+                      constant: "0"
+            otherwise:
+              steps:
+                - setProperty:
+                    name: finished
+                    constant: "no"
+                - setProperty:
+                    name: retryHttp
+                    constant: "no"
+                - setProperty:
+                    name: tries
+                    constant: "0"
+
+- route:
+    id: directum-apply
+    errorHandler:
+      defaultErrorHandler:
+        useOriginalMessage: true
+        redeliveryPolicy:
+          maximumRedeliveries: -1
+          redeliveryDelay: 1000
+          maximumRedeliveryDelay: 5000
+          backOffMultiplier: 2
+          useExponentialBackOff: true
+          logRetryAttempted: true
+          retryAttemptedLogLevel: WARN
+    from:
+      uri: direct:directum-apply
+      steps:
+        - setProperty:
+            name: event
+            groovy: |
+              def raw = exchange.getProperty('rawEvent')
+              if (raw == null) {
+                raw = exchange.getMessage().getHeader('X-Raw-Event')
+              }
+              if (raw == null) {
+                def current = exchange.getMessage().getBody()
+                if (current instanceof byte[]) raw = new String(current, 'UTF-8')
+                else raw = current == null ? '' : current.toString()
+              }
+              raw = raw.toString()
+              exchange.setProperty('rawEvent', raw)
+              def event = new com.fasterxml.jackson.databind.ObjectMapper().readValue(raw, Map.class)
+              def data = event.get('data')
+              def entityId = event.get('subject')
+              if (entityId == null && data != null) entityId = data.get('Id')
+              exchange.setProperty('entityId', entityId == null ? '' : entityId.toString())
+              exchange.setProperty('creatioId', exchange.getProperty('entityId'))
+              def modified = data == null ? null : data.get('ModifiedOn')
+              exchange.setProperty('version', modified == null ? '' : modified.toString())
+              def eventId = event.get('id')
+              exchange.setProperty('eventId', eventId == null ? '' : eventId.toString())
+              exchange.setProperty('poison', exchange.getProperty('version') == '' ? 'yes' : 'no')
+              return event
+        - choice:
+            when:
+              - simple: "${exchangeProperty.poison} == 'yes'"
+                steps:
+                  - to: direct:directum-dlq
+                  - stop: {}
+        - to: direct:read-version
+        - choice:
+            when:
+              - simple: "${exchangeProperty.applyDecision} == 'skip'"
+                steps:
+                  - log:
+                      message: "пропуск: версия не новее system=${exchangeProperty.system} entity=${exchangeProperty.entityId} version=${exchangeProperty.version}"
+                  - to: direct:kafka-commit
+            otherwise:
+              steps:
+                - setProperty:
+                    name: lookupReady
+                    constant: "no"
+                - loop:
+                    doWhile: true
+                    expression:
+                      simple: "${exchangeProperty.lookupReady} == 'no'"
+                    steps:
+                      - removeHeaders:
+                          pattern: ".*"
+                      - setHeader:
+                          name: Username
+                          constant: ibus
+                      - setHeader:
+                          name: Password
+                          constant: ibus
+                      - setHeader:
+                          name: Accept
+                          constant: application/json
+                      - setHeader:
+                          name: CamelHttpMethod
+                          constant: GET
+                      - setHeader:
+                          name: CamelHttpQuery
+                          simple: "code=${exchangeProperty.creatioId}"
+                      - to: "http://directum-rx:8080/Integration/odata/ICompanies?bridgeEndpoint=true&throwExceptionOnFailure=false"
+                      - setProperty:
+                          name: directumLookup
+                          groovy: |
+                            def code = exchange.getMessage().getHeader('CamelHttpResponseCode')
+                            int status = 0
+                            if (code instanceof Number) {
+                              status = code.intValue()
+                            } else if (code != null && code.toString().trim()) {
+                              status = Integer.parseInt(code.toString())
+                            }
+                            exchange.setProperty('httpCode', status)
+                            if (status == 429 || status >= 500 || status == 0) {
+                              int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
+                              long pause = Math.min(1000L << Math.min(n, 3), 5000L)
+                              exchange.setProperty('tries', n + 1)
+                              exchange.setProperty('lookupReady', 'no')
+                              Thread.sleep(pause)
+                              return 'transient'
+                            }
+                            exchange.setProperty('tries', 0)
+                            exchange.setProperty('lookupReady', 'yes')
+                            if (status >= 400) return 'data'
+                            def raw = exchange.getMessage().getBody(String.class)
+                            def parsed = [:]
+                            if (raw != null && raw.trim()) {
+                              parsed = new com.fasterxml.jackson.databind.ObjectMapper().readValue(raw, Map.class)
+                            }
+                            def rows = parsed.get('value')
+                            if (rows != null && !rows.isEmpty()) {
+                              exchange.setProperty('directumId', rows.get(0).get('Id'))
+                              return 'exists'
+                            }
+                            return 'missing'
+                - choice:
+                    when:
+                      - simple: "${exchangeProperty.directumLookup} == 'data'"
+                        steps:
+                          - log:
+                              message: "ошибка данных: system=directum entity=${exchangeProperty.entityId} http=${exchangeProperty.httpCode}"
+                          - to: direct:directum-dlq
+                          - stop: {}
+                      - simple: "${exchangeProperty.directumLookup} == 'exists'"
+                        steps:
+                          - setProperty:
+                              name: retryHttp
+                              constant: "yes"
+                          - loop:
+                              doWhile: true
+                              expression:
+                                simple: "${exchangeProperty.retryHttp} == 'yes'"
+                              steps:
+                                - setBody:
+                                    groovy: |
+                                      def data = exchange.getProperty('event', Map).get('data')
+                                      def address = data.get('Address') ?: ''
+                                      def zip = data.get('Zip') ?: ''
+                                      def legal = address
+                                      if (zip) {
+                                        legal = address ? address + ', ' + zip : zip
+                                      }
+                                      def payload = new java.util.LinkedHashMap()
+                                      payload.put('Name', data.get('Name'))
+                                      payload.put('TIN', data.get('TaxId') ?: '')
+                                      payload.put('Phone', data.get('Phone') ?: '')
+                                      payload.put('LegalAddress', legal)
+                                      return payload
+                                - marshal:
+                                    json: {}
+                                - removeHeaders:
+                                    pattern: ".*"
+                                - setHeader:
+                                    name: Content-Type
+                                    constant: application/json
+                                - setHeader:
+                                    name: Username
+                                    constant: ibus
+                                - setHeader:
+                                    name: Password
+                                    constant: ibus
+                                - setHeader:
+                                    name: CamelHttpMethod
+                                    constant: PATCH
+                                - convertBodyTo:
+                                    type: byte[]
+                                - toD: "http://directum-rx:8080/Integration/odata/ICompanies(${exchangeProperty.directumId})?bridgeEndpoint=true&throwExceptionOnFailure=false"
+                                - to: direct:directum-after-http
+                          - choice:
+                              when:
+                                - simple: "${exchangeProperty.finished} == 'yes'"
+                                  steps:
+                                    - stop: {}
+                    otherwise:
+                      steps:
+                        - setProperty:
+                            name: retryHttp
+                            constant: "yes"
+                        - loop:
+                            doWhile: true
+                            expression:
+                              simple: "${exchangeProperty.retryHttp} == 'yes'"
+                            steps:
+                              - setBody:
+                                  groovy: |
+                                    def data = exchange.getProperty('event', Map).get('data')
+                                    def address = data.get('Address') ?: ''
+                                    def zip = data.get('Zip') ?: ''
+                                    def legal = address
+                                    if (zip) {
+                                      legal = address ? address + ', ' + zip : zip
+                                    }
+                                    def payload = new java.util.LinkedHashMap()
+                                    payload.put('Name', data.get('Name'))
+                                    payload.put('TIN', data.get('TaxId') ?: '')
+                                    payload.put('Phone', data.get('Phone') ?: '')
+                                    payload.put('LegalAddress', legal)
+                                    payload.put('Code', data.get('Id'))
+                                    return payload
+                              - marshal:
+                                  json: {}
+                              - removeHeaders:
+                                  pattern: ".*"
+                              - setHeader:
+                                  name: Content-Type
+                                  constant: application/json
+                              - setHeader:
+                                  name: Username
+                                  constant: ibus
+                              - setHeader:
+                                  name: Password
+                                  constant: ibus
+                              - setHeader:
+                                  name: CamelHttpMethod
+                                  constant: POST
+                              - convertBodyTo:
+                                  type: byte[]
+                              - to: "http://directum-rx:8080/Integration/odata/ICompanies?bridgeEndpoint=true&throwExceptionOnFailure=false"
+                              - to: direct:directum-after-http
+                        - choice:
+                            when:
+                              - simple: "${exchangeProperty.finished} == 'yes'"
+                                steps:
+                                  - stop: {}
+                - to: direct:write-version
+                - log:
+                    message: "записано: system=${exchangeProperty.system} entity=${exchangeProperty.entityId} version=${exchangeProperty.version}"
+                - to: direct:kafka-commit

@@ -83,7 +83,7 @@
     .meta { color: var(--muted); font-size: 13px; word-break: break-all; }
     .empty { color: var(--muted); font-size: 14px; }
     .topics, .packets { margin: 16px 0 0; }
-    .topic-grid { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 12px; }
+    .topic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
     .packet-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
     .step { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
     details { margin-top: 6px; }
@@ -148,6 +148,9 @@
           <button id="to-sap" type="button">3. Получить в SAP</button>
           <button id="to-directum" type="button">3. Получить в Directum</button>
           <button class="warn" id="fail" type="button">Directum недоступен</button>
+          <button id="up" type="button">Directum снова доступен</button>
+          <button class="bad" id="data-error" type="button">Ошибка данных Directum</button>
+          <button id="replay" type="button">Повторить из DLQ</button>
         </div>
 
         <p class="status" id="status">Шаг 1 — записать карточку в Creatio. В топик она сама не уйдёт.</p>
@@ -157,7 +160,10 @@
           <strong>Положить в топик</strong> — Camel собирает конверт CloudEvents и публикует его. SAP и Directum ещё молчат.<br>
           <strong>Получить</strong> — на время чтения включается одна группа. Ниже видно тело, которое Camel отправил в эту систему.<br>
           После <strong>Изменить</strong> снова нажмите «Положить в топик» и обе кнопки получения: ниже появятся уже новые тела.<br>
-          <strong>Directum недоступен</strong> новое сообщение не создаёт. Читатель забирает то, что уже лежит в топике, Directum на этот запрос не отвечает, карточка не появляется, а то же сообщение попадает в топик ошибок Directum.
+          <strong>Directum недоступен</strong> новое сообщение не создаёт. Читатель остаётся на том же сообщении и повторяет запись. Список ошибок пуст, карточка не появляется.<br>
+          <strong>Directum снова доступен</strong> снимает недоступность. То же сообщение дописывается само, без новой публикации.<br>
+          <strong>Ошибка данных</strong> — Directum отвечает отказом 400. Сообщение уходит только в его список ошибок, следующая карточка не ждёт.<br>
+          <strong>Повторить из DLQ</strong> копирует это сообщение в топик <code>replay.directum.account</code>. SAP его не видит. Если в Directum уже более новая версия, старое пропускается.
         </p>
       </section>
 
@@ -202,10 +208,19 @@
 
     <section class="topics">
       <div class="card-head">
+        <h2>Что записано</h2>
+        <span class="count" id="delivery-count"></span>
+      </div>
+      <p class="lead">Последняя версия, которую шина уже применила в каждой системе. Версия — это <code>ModifiedOn</code> карточки Creatio. Пока строки нет, система эту карточку ещё не приняла.</p>
+      <div id="delivery"></div>
+    </section>
+
+    <section class="topics">
+      <div class="card-head">
         <h2>Топики Redpanda</h2>
         <a id="console" href="#" target="_blank">Открыть в Redpanda Console</a>
       </div>
-      <p class="lead">В каждом топике — лента сообщений. <strong>Факт изменения</strong> получают все группы чтения. <strong>Ошибки SAP</strong> и <strong>Ошибки Directum</strong> — это отдельные топики, куда падают сообщения, если соответствующая система отказала.</p>
+      <p class="lead">В каждом топике — лента сообщений. <strong>Факт изменения</strong> получают обе группы чтения. <strong>Ошибки</strong> — отказ данных конкретной системы. <strong>Повтор</strong> читает только она: сюда сообщение кладут вручную из её списка ошибок.</p>
       <div class="topic-grid" id="topics"></div>
     </section>
   </main>
@@ -217,7 +232,9 @@
     const topicTitles = {
       "crm.account.upserted.v1": "Факт изменения",
       "dlq.sap.account": "Ошибки SAP",
-      "dlq.directum.account": "Ошибки Directum"
+      "dlq.directum.account": "Ошибки Directum",
+      "replay.sap.account": "Повтор SAP",
+      "replay.directum.account": "Повтор Directum"
     };
 
     document.querySelector("#console").href = location.protocol + "//" + location.hostname + ":8088/topics/crm.account.upserted.v1";
@@ -364,8 +381,10 @@
       renderList("#creatio", data.creatio || [], (row) => item(row.Name, [
         row.Code ? "код " + row.Code : "",
         "Id " + row.Id,
+        row.ModifiedOn ? "версия " + row.ModifiedOn : "",
         row.TaxId ? "налог " + row.TaxId : ""
       ].filter(Boolean)));
+      renderDelivery(data.deliveryState || [], errors.deliveryState || "");
       renderList("#sap", data.sap || [], (row) => item(row.CardName, [
         "CardCode " + row.CardCode,
         row.FederalTaxID ? "налог " + row.FederalTaxID : "",
@@ -402,6 +421,32 @@
       const company = (data.directum || []).find((row) => row.Code === currentId);
       showPacket("packet-sap", formatInbox(latestRow(data.sapPackets || [], (row) => matchesSap(row, code), idKnown)), true);
       showPacket("packet-directum", formatInbox(latestRow(data.directumPackets || [], (row) => matchesDirectum(row, currentId, company), idKnown)), true);
+    }
+    function renderDelivery(rows, errorText) {
+      const root = document.querySelector("#delivery");
+      const count = document.querySelector("#delivery-count");
+      count.textContent = rows.length ? String(rows.length) : "";
+      root.replaceChildren();
+      if (!rows.length) {
+        const p = document.createElement("p");
+        p.className = "empty";
+        p.textContent = "Пока ни одна система не записала версию.";
+        root.appendChild(p);
+      } else {
+        const list = document.createElement("ul");
+        rows.forEach((row) => list.appendChild(item(row.system + " · " + row.entity_id, [
+          "версия " + row.version,
+          "событие " + row.event_id,
+          row.applied_at ? "записано " + row.applied_at : ""
+        ].filter(Boolean))));
+        root.appendChild(list);
+      }
+      if (errorText) {
+        const err = document.createElement("p");
+        err.className = "err";
+        err.textContent = errorText;
+        root.appendChild(err);
+      }
     }
     function matchesSap(row, code) {
       if (!code) return false;
@@ -510,6 +555,11 @@
           return;
         }
         const packets = payload.packets || [];
+        if (payload.status === "skipped") {
+          setStatus("Версия не новее уже записанной. В систему повторно не пишем.");
+          await refresh();
+          return;
+        }
         if (!packets.length) {
           setStatus(emptyText, true);
           return;
@@ -548,9 +598,6 @@
           setStatus((payload && payload.error) || "Читатель Directum не запустился", true);
           return;
         }
-        if (payload.packets && payload.packets.length) {
-          showPacket("packet-directum", formatInbox(payload.packets[payload.packets.length - 1]), true);
-        }
         await refresh();
         const after = await fetch("/api/snapshot", { cache: "no-store" }).then((response) => response.json());
         const topicAfter = ((after.topics || {})["crm.account.upserted.v1"] || {}).count || 0;
@@ -559,19 +606,89 @@
           setStatus("В топике стало больше сообщений. Так быть не должно.", true);
           return;
         }
-        if (errorsAfter !== errorsBefore + 1) {
-          setStatus("Для Directum новых сообщений нет. Сначала положите карточку в топик.", true);
+        if (errorsAfter !== errorsBefore) {
+          setStatus("Сообщение попало в список ошибок. Для недоступности так быть не должно.", true);
           return;
         }
         if ((after.directum || []).length > (before.directum || []).length) {
           setStatus("Directum записал карточку, хотя был недоступен.", true);
           return;
         }
-        setStatus("Directum был недоступен. Новое сообщение в топик не клалось. То же сообщение лежит в «Ошибки Directum», карточка в Directum не появилась.");
+        setStatus("Directum недоступен. Читатель ждёт и повторяет то же сообщение. Список ошибок пуст, карточка не появилась. Нажмите «Directum снова доступен».");
+      });
+    };
+    document.querySelector("#up").onclick = () => {
+      withButtons("Directum снова доступен. Жду, пока то же сообщение допишется само.", async () => {
+        const response = await fetch("/api/deliver/directum/up", { method: "POST" });
+        const payload = await response.json();
+        if (!response.ok) {
+          setStatus((payload && payload.error) || "Читатель Directum не дописал сообщение", true);
+          return;
+        }
+        if (payload.status === "timeout") {
+          setStatus("Directum так и не принял сообщение.", true);
+          await refresh();
+          return;
+        }
+        setStatus("Directum снова доступен. Сообщение дошло само, новую публикацию не делали.");
+        await refresh();
+      });
+    };
+    document.querySelector("#data-error").onclick = () => {
+      withButtons("Directum отвечает отказом данных. Забираю сообщение, которое уже лежит в топике.", async () => {
+        const before = await fetch("/api/snapshot", { cache: "no-store" }).then((response) => response.json());
+        const topicBefore = ((before.topics || {})["crm.account.upserted.v1"] || {}).count || 0;
+        const errorsBefore = ((before.topics || {})["dlq.directum.account"] || {}).count || 0;
+        const response = await fetch("/api/deliver/directum/data-error", { method: "POST" });
+        const payload = await response.json();
+        if (!response.ok) {
+          setStatus((payload && payload.error) || "Читатель Directum не запустился", true);
+          return;
+        }
+        await refresh();
+        const after = await fetch("/api/snapshot", { cache: "no-store" }).then((response) => response.json());
+        const topicAfter = ((after.topics || {})["crm.account.upserted.v1"] || {}).count || 0;
+        const errorsAfter = ((after.topics || {})["dlq.directum.account"] || {}).count || 0;
+        if (payload.status !== "data-error" || errorsAfter !== errorsBefore + 1) {
+          setStatus("Для Directum новых сообщений нет. Сначала положите карточку в топик.", true);
+          return;
+        }
+        if (topicAfter !== topicBefore) {
+          setStatus("В общий топик попало лишнее сообщение.", true);
+          return;
+        }
+        if ((after.directum || []).length > (before.directum || []).length) {
+          setStatus("Directum записал карточку, хотя ответил отказом.", true);
+          return;
+        }
+        setStatus("Ошибка данных. Сообщение лежит только в «Ошибки Directum». Карточка в Directum не изменилась.");
+      });
+    };
+    document.querySelector("#replay").onclick = () => {
+      withButtons("Копирую сообщение из списка ошибок Directum в его топик повтора.", async () => {
+        const before = await fetch("/api/snapshot", { cache: "no-store" }).then((response) => response.json());
+        const response = await fetch("/api/replay/directum", { method: "POST" });
+        const payload = await response.json();
+        if (!response.ok) {
+          setStatus((payload && payload.error) || "Повтор не запустился", true);
+          return;
+        }
+        await refresh();
+        const after = await fetch("/api/snapshot", { cache: "no-store" }).then((response) => response.json());
+        const sapSame = JSON.stringify(before.sap || []) === JSON.stringify(after.sap || []);
+        if (!sapSame) {
+          setStatus("Повтор задел SAP. Так быть не должно.", true);
+          return;
+        }
+        if (payload.status === "timeout") {
+          setStatus("Читатель повтора не подтвердил сообщение.", true);
+          return;
+        }
+        setStatus("Повтор ушёл только в Directum. SAP не читал это сообщение.");
       });
     };
     document.querySelector("#clear").onclick = async () => {
-      if (!confirm("Очистить стенд: карточки Creatio, SAP и Directum, сообщения в топиках и логи контейнеров?")) return;
+      if (!confirm("Очистить стенд: карточки, топики, таблицу версий и логи контейнеров?")) return;
       const buttons = document.querySelectorAll("button");
       buttons.forEach((button) => { button.disabled = true; });
       setStatus("Очищаю эмуляторы, топики и логи...");

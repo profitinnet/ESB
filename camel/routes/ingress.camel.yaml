@@ -10,7 +10,6 @@
             constant: application/json
         - setBody:
             constant: '{"status":"ok"}'
-
 - route:
     id: ingress-account
     from:
@@ -22,20 +21,28 @@
             json: {}
         - setProperty:
             name: account
-            simple: "${body}"
+            simple: ${body}
         - setProperty:
             name: accountValid
-            groovy: |
+            groovy: >
               def account = exchange.getProperty('account', Map)
+
               def id = account.get('Id')
+
               def name = account.get('Name')
-              if (id != null && !id.toString().trim().isEmpty() && name != null && !name.toString().trim().isEmpty()) {
+
+              def modified = account.get('ModifiedOn')
+
+              if (id != null && !id.toString().trim().isEmpty() && name != null
+              && !name.toString().trim().isEmpty() && modified != null
+              && !modified.toString().trim().isEmpty()) {
                 return 'yes'
               }
+
               return 'no'
         - choice:
             when:
-              - simple: "${exchangeProperty.accountValid} == 'no'"
+              - simple: ${exchangeProperty.accountValid} == 'no'
                 steps:
                   - setHeader:
                       name: Content-Type
@@ -44,13 +51,13 @@
                       name: CamelHttpResponseCode
                       constant: "400"
                   - setBody:
-                      constant: '{"error":"Id and Name are required"}'
+                      constant: '{"error":"Id, Name and ModifiedOn are required"}'
             otherwise:
               steps:
                 - setBody:
                     groovy: |
                       def account = exchange.getProperty('account', Map)
-                      def eventId = java.util.UUID.randomUUID().toString()
+                      def eventId = account.get('Id').toString() + ':' + account.get('ModifiedOn').toString()
                       def event = new java.util.LinkedHashMap()
                       event.put('specversion', '1.0')
                       event.put('id', eventId)
@@ -66,16 +73,19 @@
                     json: {}
                 - setProperty:
                     name: eventJson
-                    simple: "${body}"
+                    simple: ${body}
                 - removeHeaders:
-                    pattern: ".*"
+                    pattern: .*
                 - setHeader:
                     name: kafka.KEY
-                    simple: "${exchangeProperty.account[Id]}"
+                    simple: ${exchangeProperty.account[Id]}
                 - to:
                     uri: kafka:crm.account.upserted.v1
                     parameters:
                       brokers: redpanda:9092
+                      requestRequiredAcks: all
+                      enableIdempotence: true
+                      retries: 10
                 - setHeader:
                     name: Content-Type
                     constant: application/json
@@ -83,4 +93,4 @@
                     name: CamelHttpResponseCode
                     constant: "202"
                 - setBody:
-                    simple: "${exchangeProperty.eventJson}"
+                    simple: ${exchangeProperty.eventJson}

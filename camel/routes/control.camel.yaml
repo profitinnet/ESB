@@ -17,20 +17,21 @@
                 if (!system && parts.size() > 1) system = parts[1]
                 if (!action && parts.size() > 2) action = parts[2]
               }
-              def routeId = system == 'directum' ? 'directum-account' : 'sap-account'
+              def routeIds = system == 'directum'
+                ? ['directum-account', 'directum-account-replay']
+                : ['sap-account', 'sap-account-replay']
               def controller = exchange.getContext().getRouteController()
-              def status = controller.getRouteStatus(routeId)
-              def started = status != null && status.isStarted()
-              if (action == 'stop') {
-                if (started) {
-                  controller.stopRoute(routeId)
+              routeIds.each { routeId ->
+                def status = controller.getRouteStatus(routeId)
+                def started = status != null && status.isStarted()
+                if (action == 'stop') {
+                  if (started) controller.stopRoute(routeId)
+                } else if (!started) {
+                  controller.startRoute(routeId)
                 }
-                return '{"status":"stopped","route":"' + routeId + '"}'
               }
-              if (!started) {
-                controller.startRoute(routeId)
-              }
-              return '{"status":"started","route":"' + routeId + '"}'
+              def state = action == 'stop' ? 'stopped' : 'started'
+              return '{"status":"' + state + '","routes":"' + routeIds.join(',') + '"}'
         - setHeader:
             name: Content-Type
             constant: application/json

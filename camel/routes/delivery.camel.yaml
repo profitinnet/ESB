@@ -1,0 +1,166 @@
+# Last applied ModifiedOn per system. Camel reads it before HTTP and
+# writes it only after the target system accepted the card.
+- beans:
+    - name: deliveryDataSource
+      type: org.postgresql.ds.PGSimpleDataSource
+      properties:
+        url: "jdbc:postgresql://postgres:5432/ibus?connectTimeout=5"
+        user: ibus
+        password: ibus
+
+- route:
+    id: capture-kafka
+    errorHandler:
+      noErrorHandler: {}
+    from:
+      uri: direct:capture-kafka
+      steps:
+        - setProperty:
+            name: rawEvent
+            groovy: |
+              def current = exchange.getMessage().getBody()
+              def text = current instanceof byte[] ? new String(current, 'UTF-8') : (current == null ? '' : current.toString())
+              exchange.getMessage().setHeader('X-Raw-Event', text)
+              return text
+        - setProperty:
+            name: kafkaCommit
+            groovy: |
+              return exchange.getMessage().getHeader('CamelKafkaManualCommit')
+
+- route:
+    id: read-version
+    errorHandler:
+      noErrorHandler: {}
+    from:
+      uri: direct:read-version
+      steps:
+        - setHeader:
+            name: system
+            simple: ${exchangeProperty.system}
+        - setHeader:
+            name: entityId
+            simple: ${exchangeProperty.entityId}
+        - to:
+            uri: sql
+            parameters:
+              query: "SELECT version FROM delivery_state WHERE system=:#system AND entity_id=:#entityId"
+              dataSource: "#deliveryDataSource"
+              outputType: SelectOne
+              useMessageBodyForSql: false
+        - setProperty:
+            name: applyDecision
+            groovy: |
+              def row = body
+              if (row instanceof List) {
+                row = row ? row.get(0) : null
+              }
+              def stored = null
+              if (row instanceof Map) {
+                stored = row.get('version')
+                if (stored == null) stored = row.get('VERSION')
+              } else if (row != null) {
+                stored = row.toString()
+              }
+              if (stored != null) {
+                exchange.setProperty('storedVersion', stored.toString())
+              }
+              def incoming = exchange.getProperty('version')
+              if (stored != null && incoming != null && stored.toString().compareTo(incoming.toString()) >= 0) {
+                return 'skip'
+              }
+              return 'apply'
+
+- route:
+    id: write-version
+    errorHandler:
+      noErrorHandler: {}
+    from:
+      uri: direct:write-version
+      steps:
+        - setHeader:
+            name: system
+            simple: ${exchangeProperty.system}
+        - setHeader:
+            name: entityId
+            simple: ${exchangeProperty.entityId}
+        - setHeader:
+            name: version
+            simple: ${exchangeProperty.version}
+        - setHeader:
+            name: eventId
+            simple: ${exchangeProperty.eventId}
+        - to:
+            uri: sql
+            parameters:
+              query: "INSERT INTO delivery_state (system, entity_id, version, event_id, applied_at) VALUES (:#system, :#entityId, :#version, :#eventId, CURRENT_TIMESTAMP) ON CONFLICT (system, entity_id) DO UPDATE SET version = EXCLUDED.version, event_id = EXCLUDED.event_id, applied_at = CURRENT_TIMESTAMP"
+              dataSource: "#deliveryDataSource"
+              useMessageBodyForSql: false
+
+- route:
+    id: kafka-commit
+    errorHandler:
+      noErrorHandler: {}
+    from:
+      uri: direct:kafka-commit
+      steps:
+        - setProperty:
+            name: committed
+            groovy: |
+              def manual = exchange.getProperty('kafkaCommit')
+              if (manual == null) {
+                manual = exchange.getMessage().getHeader('CamelKafkaManualCommit')
+              }
+              if (manual == null) {
+                throw new IllegalStateException('CamelKafkaManualCommit is missing')
+              }
+              manual.commit()
+              return 'yes'
+
+- route:
+    id: delivery-state-list
+    from:
+      uri: platform-http:/delivery-state
+      parameters:
+        httpMethodRestrict: GET
+      steps:
+        - to:
+            uri: sql
+            parameters:
+              query: "SELECT system, entity_id, version, event_id, applied_at FROM delivery_state ORDER BY system, entity_id"
+              dataSource: "#deliveryDataSource"
+              outputType: SelectList
+              useMessageBodyForSql: false
+        - setHeader:
+            name: Content-Type
+            constant: application/json
+        - setBody:
+            groovy: |
+              def rows = body instanceof List ? body : []
+              def mapped = []
+              rows.each { row ->
+                def out = new java.util.LinkedHashMap()
+                row.each { key, value ->
+                  out.put(key.toString(), value == null ? null : value.toString())
+                }
+                mapped.add(out)
+              }
+              return new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString([value: mapped])
+
+- route:
+    id: delivery-state-clear
+    from:
+      uri: platform-http:/delivery-state/clear
+      parameters:
+        httpMethodRestrict: POST
+      steps:
+        - to:
+            uri: sql
+            parameters:
+              query: "DELETE FROM delivery_state"
+              dataSource: "#deliveryDataSource"
+              useMessageBodyForSql: false
+        - setHeader:
+            name: Content-Type
+            constant: application/json
+        - setBody:
+            constant: '{"status":"cleared"}'

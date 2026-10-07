@@ -9,6 +9,8 @@ SERVICE selects which contract this process speaks:
 import json
 import os
 import threading
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -27,11 +29,14 @@ companies = {}
 inbox = []
 reject_codes = set()
 directum_down = False
+directum_data_error = False
+directum_delay_s = 0
 next_company_id = 1
 
 
 def now_iso():
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    # Milliseconds stay in the timestamp. Two saves in the same second are two versions.
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def read_body(handler):
@@ -129,8 +134,10 @@ class Handler(BaseHTTPRequestHandler):
             companies.clear()
             inbox.clear()
             reject_codes.clear()
-            global next_company_id, directum_down
+            global next_company_id, directum_down, directum_data_error, directum_delay_s
             directum_down = False
+            directum_data_error = False
+            directum_delay_s = 0
             next_company_id = 1
         send(self, 200, {"status": "cleared"})
 
@@ -336,6 +343,23 @@ class Handler(BaseHTTPRequestHandler):
                 directum_down = path == "/pilot/down"
             send(self, 200, {"status": "down" if directum_down else "up"})
             return
+        if path in ("/pilot/data-error", "/pilot/data-ok"):
+            global directum_data_error
+            with lock:
+                directum_data_error = path == "/pilot/data-error"
+            send(self, 200, {"status": "data-error" if directum_data_error else "data-ok"})
+            return
+        if path == "/pilot/delay":
+            try:
+                body = read_json(self)
+            except json.JSONDecodeError:
+                send(self, 400, {"error": {"message": "invalid json"}})
+                return
+            global directum_delay_s
+            with lock:
+                directum_delay_s = float(body.get("seconds") or 0)
+            send(self, 200, {"status": "delay", "seconds": directum_delay_s})
+            return
         if path in ("/pilot/reject", "/pilot/release"):
             try:
                 body = read_json(self)
@@ -364,6 +388,9 @@ class Handler(BaseHTTPRequestHandler):
         if directum_is_down():
             send(self, 503, {"error": {"message": "Directum unavailable"}})
             return
+        if directum_data_error_on():
+            send(self, 400, {"error": {"message": "data rejected"}})
+            return
         if directum_must_reject(self, body, body.get("Code") or ""):
             send(self, 400, {"error": {"message": "forced failure for pilot check"}})
             return
@@ -387,6 +414,7 @@ class Handler(BaseHTTPRequestHandler):
             }
             next_company_id += 1
             companies[company["Id"]] = company
+        pilot_delay()
         send(self, 201, company)
 
     def directum_patch(self):
@@ -405,6 +433,9 @@ class Handler(BaseHTTPRequestHandler):
         if directum_is_down():
             send(self, 503, {"error": {"message": "Directum unavailable"}})
             return
+        if directum_data_error_on():
+            send(self, 400, {"error": {"message": "data rejected"}})
+            return
         with lock:
             current = companies.get(company_id)
             current_code = current.get("Code") if current else ""
@@ -422,12 +453,25 @@ class Handler(BaseHTTPRequestHandler):
             for field in ("Name", "TIN", "Phone", "LegalAddress"):
                 if field in body:
                     company[field] = body[field]
+        pilot_delay()
         send(self, 200, company)
 
 
 def directum_is_down():
     with lock:
         return directum_down
+
+
+def directum_data_error_on():
+    with lock:
+        return directum_data_error
+
+
+def pilot_delay():
+    with lock:
+        seconds = directum_delay_s
+    if seconds and seconds > 0:
+        time.sleep(seconds)
 
 
 def directum_must_reject(self, body, code):
@@ -447,14 +491,29 @@ def remember(method, path, body):
 
 def call_bus(account):
     data = json.dumps(account, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        BUS_URL,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        response.read()
+    delay = 0.5
+    last = None
+    for attempt in range(6):
+        request = urllib.request.Request(
+            BUS_URL,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                response.read()
+                return
+        except urllib.error.HTTPError as exc:
+            if 400 <= exc.code < 500:
+                raise
+            last = exc
+        except Exception as exc:
+            last = exc
+        if attempt < 5:
+            time.sleep(delay)
+            delay = min(delay * 2, 8)
+    raise last
 
 
 def card_code_from_path(path):

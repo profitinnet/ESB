@@ -36,6 +36,27 @@ services:
       - redpanda_default
     restart: unless-stopped
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: ibus-postgres
+    environment:
+      POSTGRES_USER: ibus
+      POSTGRES_PASSWORD: ibus
+      POSTGRES_DB: ibus
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - ibus-postgres:/var/lib/postgresql/data
+      - ../db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ibus -d ibus"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - redpanda_default
+    restart: unless-stopped
+
   stand:
     build: ../stand
     image: ibus-stand:pilot
@@ -61,15 +82,18 @@ services:
     container_name: ibus-camel
     command:
       - run
-      - /integrations/ingress.yaml
-      - /integrations/sap-account.yaml
-      - /integrations/directum-account.yaml
-      - /integrations/control.yaml
+      - /integrations/delivery.camel.yaml
+      - /integrations/ingress.camel.yaml
+      - /integrations/sap-account.camel.yaml
+      - /integrations/directum-account.camel.yaml
+      - /integrations/control.camel.yaml
       - --dep=camel:kafka
       - --dep=camel:http
       - --dep=camel:jackson
       - --dep=camel:groovy
+      - --dep=camel:sql
       - --dep=camel:platform-http
+      - --dep=org.postgresql:postgresql:42.7.4
     volumes:
       - ../camel/routes:/integrations:ro
     ports:
@@ -77,10 +101,28 @@ services:
     networks:
       - redpanda_default
     depends_on:
-      - sap-b1
-      - directum-rx
+      postgres:
+        condition: service_healthy
+      sap-b1:
+        condition: service_started
+      directum-rx:
+        condition: service_started
+    restart: unless-stopped
+
+  kaoto:
+    image: quay.io/kaotoio/kaoto-app:main
+    container_name: ibus-kaoto
+    ports:
+      - "8895:8080"
+    volumes:
+      - ./kaoto-nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - redpanda_default
     restart: unless-stopped
 
 networks:
   redpanda_default:
     external: true
+
+volumes:
+  ibus-postgres:
