@@ -18,8 +18,8 @@
                 if (!action && parts.size() > 2) action = parts[2]
               }
               def routeIds = system == 'directum'
-                ? ['directum-account', 'directum-account-replay']
-                : ['sap-account', 'sap-account-replay']
+                ? ['directum-account']
+                : ['sap-account']
               def controller = exchange.getContext().getRouteController()
               routeIds.each { routeId ->
                 def status = controller.getRouteStatus(routeId)

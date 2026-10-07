@@ -2,33 +2,10 @@
     id: sap-account
     autoStartup: false
     from:
-      uri: kafka:crm.account.upserted.v1
+      uri: "kafka:crm.account.upserted.v1,replay.sap.account"
       parameters:
         brokers: redpanda:9092
         groupId: ibus-sap
-        autoOffsetReset: earliest
-        autoCommitEnable: false
-        allowManualCommit: true
-        breakOnFirstError: true
-        maxPollRecords: 1
-        maxPollIntervalMs: 3600000
-        sessionTimeoutMs: 10000
-        heartbeatIntervalMs: 3000
-      steps:
-        - setProperty:
-            name: system
-            constant: sap
-        - to: direct:capture-kafka
-        - to: direct:sap-apply
-
-- route:
-    id: sap-account-replay
-    autoStartup: false
-    from:
-      uri: kafka:replay.sap.account
-      parameters:
-        brokers: redpanda:9092
-        groupId: ibus-sap-replay
         autoOffsetReset: earliest
         autoCommitEnable: false
         allowManualCommit: true
@@ -87,13 +64,14 @@
                 status = Integer.parseInt(code.toString())
               }
               exchange.setProperty('httpCode', status)
-              if (status == 429 || status >= 500 || status == 0) {
-                return 'transient'
-              }
-              if (status >= 400) {
-                return 'data'
-              }
-              return 'ok'
+              if (status >= 200 && status < 300) return 'ok'
+              if (status == 409) return 'conflict'
+              if (status == 401 || status == 403) return 'relogin'
+              if (status == 408 || status == 429) return 'transient'
+              if (status >= 300 && status < 400) return 'transient'
+              if (status >= 500 || status == 0) return 'transient'
+              if (status >= 400) return 'data'
+              return 'transient'
         - choice:
             when:
               - simple: "${exchangeProperty.httpResult} == 'transient'"
@@ -106,13 +84,26 @@
                         exchange.setProperty('tries', n + 1)
                         Thread.sleep(pause)
                         return 'yes'
-              - simple: "${exchangeProperty.httpResult} == 'data'"
-                steps:
-                  - log:
-                      message: "ошибка данных: system=sap entity=${exchangeProperty.entityId} http=${exchangeProperty.httpCode}"
-                  - to: direct:sap-dlq
                   - setProperty:
-                      name: finished
+                      name: conflict
+                      constant: "no"
+              - simple: "${exchangeProperty.httpResult} == 'relogin'"
+                steps:
+                  - setProperty:
+                      name: retryHttp
+                      groovy: |
+                        int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
+                        long pause = Math.min(1000L << Math.min(n, 3), 5000L)
+                        exchange.setProperty('tries', n + 1)
+                        Thread.sleep(pause)
+                        return 'no'
+                  - setProperty:
+                      name: conflict
+                      constant: "no"
+              - simple: "${exchangeProperty.httpResult} == 'conflict'"
+                steps:
+                  - setProperty:
+                      name: conflict
                       constant: "yes"
                   - setProperty:
                       name: retryHttp
@@ -120,13 +111,24 @@
                   - setProperty:
                       name: tries
                       constant: "0"
+              - simple: "${exchangeProperty.httpResult} == 'data'"
+                steps:
+                  - setProperty:
+                      name: retryHttp
+                      constant: "no"
+                  - setProperty:
+                      name: conflict
+                      constant: "no"
+                  - setProperty:
+                      name: tries
+                      constant: "0"
             otherwise:
               steps:
                 - setProperty:
-                    name: finished
+                    name: retryHttp
                     constant: "no"
                 - setProperty:
-                    name: retryHttp
+                    name: conflict
                     constant: "no"
                 - setProperty:
                     name: tries
@@ -162,7 +164,18 @@
               }
               raw = raw.toString()
               exchange.setProperty('rawEvent', raw)
-              def event = new com.fasterxml.jackson.databind.ObjectMapper().readValue(raw, Map.class)
+              exchange.setProperty('poison', 'no')
+              exchange.setProperty('entityId', '')
+              exchange.setProperty('version', '')
+              exchange.setProperty('eventId', '')
+              exchange.setProperty('cardCode', '')
+              def event = null
+              try {
+                event = new com.fasterxml.jackson.databind.ObjectMapper().readValue(raw, Map.class)
+              } catch (Exception ignored) {
+                exchange.setProperty('poison', 'yes')
+                return raw
+              }
               def data = event.get('data')
               def entityId = event.get('subject')
               if (entityId == null && data != null) entityId = data.get('Id')
@@ -171,7 +184,19 @@
               exchange.setProperty('version', modified == null ? '' : modified.toString())
               def eventId = event.get('id')
               exchange.setProperty('eventId', eventId == null ? '' : eventId.toString())
-              exchange.setProperty('poison', exchange.getProperty('version') == '' ? 'yes' : 'no')
+              if (exchange.getProperty('version') == '') {
+                exchange.setProperty('poison', 'yes')
+              } else {
+                try {
+                  java.time.OffsetDateTime.parse(exchange.getProperty('version').toString())
+                } catch (Exception ignored) {
+                  try {
+                    java.time.Instant.parse(exchange.getProperty('version').toString())
+                  } catch (Exception ignoredAgain) {
+                    exchange.setProperty('poison', 'yes')
+                  }
+                }
+              }
               def code = data == null ? null : data.get('Code')
               def card = ''
               if (code != null && code.toString().trim()) {
@@ -192,6 +217,10 @@
         - to: direct:read-version
         - choice:
             when:
+              - simple: "${exchangeProperty.applyDecision} == 'poison'"
+                steps:
+                  - to: direct:sap-dlq
+                  - stop: {}
               - simple: "${exchangeProperty.applyDecision} == 'skip'"
                 steps:
                   - log:
@@ -200,94 +229,141 @@
             otherwise:
               steps:
                 - setProperty:
-                    name: retryHttp
-                    constant: "yes"
-                - loop:
-                    doWhile: true
-                    expression:
-                      simple: "${exchangeProperty.retryHttp} == 'yes'"
-                    steps:
-                      - setBody:
-                          constant: '{"CompanyDB":"SBODEMO","UserName":"manager","Password":"manager"}'
-                      - removeHeaders:
-                          pattern: ".*"
-                      - setHeader:
-                          name: Content-Type
-                          constant: application/json
-                      - setHeader:
-                          name: CamelHttpMethod
-                          constant: POST
-                      - to: "http://sap-b1:8080/b1s/v1/Login?bridgeEndpoint=true&throwExceptionOnFailure=false"
-                      - to: direct:sap-after-http
-                - choice:
-                    when:
-                      - simple: "${exchangeProperty.finished} == 'yes'"
-                        steps:
-                          - stop: {}
-                - unmarshal:
-                    json: {}
+                    name: phase
+                    constant: login
                 - setProperty:
-                    name: sessionId
-                    simple: "${body[SessionId]}"
-                - setProperty:
-                    name: lookupReady
+                    name: sawConflict
                     constant: "no"
                 - loop:
                     doWhile: true
                     expression:
-                      simple: "${exchangeProperty.lookupReady} == 'no'"
+                      simple: "${exchangeProperty.phase} == 'login' || ${exchangeProperty.phase} == 'lookup' || ${exchangeProperty.phase} == 'patch' || ${exchangeProperty.phase} == 'post'"
                     steps:
-                      - removeHeaders:
-                          pattern: ".*"
-                      - setHeader:
-                          name: Cookie
-                          simple: "B1SESSION=${exchangeProperty.sessionId}"
-                      - setHeader:
-                          name: CamelHttpMethod
-                          constant: GET
-                      - toD: "http://sap-b1:8080/b1s/v1/BusinessPartners('${exchangeProperty.cardCode}')?bridgeEndpoint=true&throwExceptionOnFailure=false"
-                      - setProperty:
-                          name: sapLookup
-                          groovy: |
-                            def code = exchange.getMessage().getHeader('CamelHttpResponseCode')
-                            int status = 0
-                            if (code instanceof Number) {
-                              status = code.intValue()
-                            } else if (code != null && code.toString().trim()) {
-                              status = Integer.parseInt(code.toString())
-                            }
-                            exchange.setProperty('httpCode', status)
-                            if (status == 429 || status >= 500 || status == 0) {
-                              int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
-                              long pause = Math.min(1000L << Math.min(n, 3), 5000L)
-                              exchange.setProperty('tries', n + 1)
-                              exchange.setProperty('lookupReady', 'no')
-                              Thread.sleep(pause)
-                              return 'transient'
-                            }
-                            exchange.setProperty('tries', 0)
-                            exchange.setProperty('lookupReady', 'yes')
-                            if (status == 200) return 'exists'
-                            if (status == 404) return 'missing'
-                            if (status >= 400) return 'data'
-                            return 'missing'
-                - choice:
-                    when:
-                      - simple: "${exchangeProperty.sapLookup} == 'data'"
-                        steps:
-                          - log:
-                              message: "ошибка данных: system=sap entity=${exchangeProperty.entityId} http=${exchangeProperty.httpCode}"
-                          - to: direct:sap-dlq
-                          - stop: {}
-                      - simple: "${exchangeProperty.sapLookup} == 'exists'"
-                        steps:
-                          - setProperty:
-                              name: retryHttp
-                              constant: "yes"
-                          - loop:
-                              doWhile: true
-                              expression:
-                                simple: "${exchangeProperty.retryHttp} == 'yes'"
+                      - choice:
+                          when:
+                            - simple: "${exchangeProperty.phase} == 'login'"
+                              steps:
+                                - setBody:
+                                    constant: '{"CompanyDB":"SBODEMO","UserName":"manager","Password":"manager"}'
+                                - removeHeaders:
+                                    pattern: ".*"
+                                - setHeader:
+                                    name: Content-Type
+                                    constant: application/json
+                                - setHeader:
+                                    name: CamelHttpMethod
+                                    constant: POST
+                                - setProperty:
+                                    name: httpFailed
+                                    constant: "no"
+                                - doTry:
+                                    steps:
+                                      - to: "http://sap-b1:8080/b1s/v1/Login?bridgeEndpoint=true&throwExceptionOnFailure=false"
+                                    doCatch:
+                                      - exception:
+                                          - java.lang.Exception
+                                        steps:
+                                          - setProperty:
+                                              name: httpFailed
+                                              constant: "yes"
+                                - choice:
+                                    when:
+                                      - simple: "${exchangeProperty.httpFailed} == 'no'"
+                                        steps:
+                                          - to: direct:sap-after-http
+                                - setProperty:
+                                    name: afterLogin
+                                    groovy: |
+                                      def failed = exchange.getProperty('httpFailed') == 'yes'
+                                      def result = exchange.getProperty('httpResult')
+                                      if (failed || result == 'transient' || result == 'relogin') {
+                                        if (failed) {
+                                          int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
+                                          long pause = Math.min(1000L << Math.min(n, 3), 5000L)
+                                          exchange.setProperty('tries', n + 1)
+                                          Thread.sleep(pause)
+                                        }
+                                        exchange.setProperty('phase', 'login')
+                                        return 'retry'
+                                      }
+                                      if (result == 'data' || result == 'conflict') {
+                                        exchange.setProperty('phase', 'stop')
+                                        return 'stop'
+                                      }
+                                      def raw = exchange.getMessage().getBody(String.class)
+                                      def parsed = new com.fasterxml.jackson.databind.ObjectMapper().readValue(raw, Map.class)
+                                      exchange.setProperty('sessionId', parsed.get('SessionId'))
+                                      exchange.setProperty('phase', 'lookup')
+                                      return 'ok'
+                            - simple: "${exchangeProperty.phase} == 'lookup'"
+                              steps:
+                                - removeHeaders:
+                                    pattern: ".*"
+                                - setHeader:
+                                    name: Cookie
+                                    simple: "B1SESSION=${exchangeProperty.sessionId}"
+                                - setHeader:
+                                    name: CamelHttpMethod
+                                    constant: GET
+                                - setProperty:
+                                    name: httpFailed
+                                    constant: "no"
+                                - doTry:
+                                    steps:
+                                      - toD: "http://sap-b1:8080/b1s/v1/BusinessPartners('${exchangeProperty.cardCode}')?bridgeEndpoint=true&throwExceptionOnFailure=false"
+                                    doCatch:
+                                      - exception:
+                                          - java.lang.Exception
+                                        steps:
+                                          - setProperty:
+                                              name: httpFailed
+                                              constant: "yes"
+                                - setProperty:
+                                    name: sapLookup
+                                    groovy: |
+                                      if (exchange.getProperty('httpFailed') == 'yes') {
+                                        int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
+                                        long pause = Math.min(1000L << Math.min(n, 3), 5000L)
+                                        exchange.setProperty('tries', n + 1)
+                                        Thread.sleep(pause)
+                                        exchange.setProperty('phase', 'lookup')
+                                        return 'transient'
+                                      }
+                                      def code = exchange.getMessage().getHeader('CamelHttpResponseCode')
+                                      int status = 0
+                                      if (code instanceof Number) status = code.intValue()
+                                      else if (code != null && code.toString().trim()) status = Integer.parseInt(code.toString())
+                                      exchange.setProperty('httpCode', status)
+                                      if (status == 401 || status == 403) {
+                                        exchange.setProperty('phase', 'login')
+                                        return 'relogin'
+                                      }
+                                      boolean retry = status == 408 || status == 429 || (status >= 300 && status < 400) || status >= 500 || status == 0
+                                      if (retry) {
+                                        int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
+                                        long pause = Math.min(1000L << Math.min(n, 3), 5000L)
+                                        exchange.setProperty('tries', n + 1)
+                                        Thread.sleep(pause)
+                                        exchange.setProperty('phase', 'lookup')
+                                        return 'transient'
+                                      }
+                                      exchange.setProperty('tries', 0)
+                                      if (status == 200) {
+                                        exchange.setProperty('phase', 'patch')
+                                        return 'exists'
+                                      }
+                                      if (status == 404) {
+                                        if (exchange.getProperty('sawConflict') == 'yes') {
+                                          exchange.setProperty('httpCode', 409)
+                                          exchange.setProperty('phase', 'stop')
+                                          return 'conflict'
+                                        }
+                                        exchange.setProperty('phase', 'post')
+                                        return 'missing'
+                                      }
+                                      exchange.setProperty('phase', 'stop')
+                                      return 'data'
+                            - simple: "${exchangeProperty.phase} == 'patch'"
                               steps:
                                 - setBody:
                                     groovy: |
@@ -322,65 +398,147 @@
                                     constant: PATCH
                                 - convertBodyTo:
                                     type: byte[]
-                                - toD: "http://sap-b1:8080/b1s/v1/BusinessPartners('${exchangeProperty.cardCode}')?bridgeEndpoint=true&throwExceptionOnFailure=false"
-                                - to: direct:sap-after-http
-                          - choice:
-                              when:
-                                - simple: "${exchangeProperty.finished} == 'yes'"
-                                  steps:
-                                    - stop: {}
+                                - setProperty:
+                                    name: httpFailed
+                                    constant: "no"
+                                - doTry:
+                                    steps:
+                                      - toD: "http://sap-b1:8080/b1s/v1/BusinessPartners('${exchangeProperty.cardCode}')?bridgeEndpoint=true&throwExceptionOnFailure=false"
+                                    doCatch:
+                                      - exception:
+                                          - java.lang.Exception
+                                        steps:
+                                          - setProperty:
+                                              name: httpFailed
+                                              constant: "yes"
+                                - choice:
+                                    when:
+                                      - simple: "${exchangeProperty.httpFailed} == 'no'"
+                                        steps:
+                                          - to: direct:sap-after-http
+                                - setProperty:
+                                    name: afterPatch
+                                    groovy: |
+                                      def failed = exchange.getProperty('httpFailed') == 'yes'
+                                      def result = exchange.getProperty('httpResult')
+                                      if (result == 'relogin') {
+                                        exchange.setProperty('phase', 'login')
+                                        return 'relogin'
+                                      }
+                                      if (failed || result == 'transient') {
+                                        if (failed) {
+                                          int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
+                                          long pause = Math.min(1000L << Math.min(n, 3), 5000L)
+                                          exchange.setProperty('tries', n + 1)
+                                          Thread.sleep(pause)
+                                        }
+                                        exchange.setProperty('phase', 'patch')
+                                        return 'retry'
+                                      }
+                                      if (result == 'data' || result == 'conflict') {
+                                        exchange.setProperty('phase', 'stop')
+                                        return 'stop'
+                                      }
+                                      exchange.setProperty('phase', 'done')
+                                      return 'done'
+                            - simple: "${exchangeProperty.phase} == 'post'"
+                              steps:
+                                - setBody:
+                                    groovy: |
+                                      def data = exchange.getProperty('event', Map).get('data')
+                                      def code = exchange.getProperty('cardCode')
+                                      def payload = new java.util.LinkedHashMap()
+                                      payload.put('CardCode', code)
+                                      payload.put('CardName', data.get('Name'))
+                                      payload.put('CardType', 'cCustomer')
+                                      payload.put('Phone1', data.get('Phone') ?: '')
+                                      payload.put('Website', data.get('Web') ?: '')
+                                      payload.put('FederalTaxID', data.get('TaxId') ?: '')
+                                      def address = new java.util.LinkedHashMap()
+                                      address.put('AddressName', 'Bill')
+                                      address.put('Street', data.get('Address') ?: '')
+                                      address.put('ZipCode', data.get('Zip') ?: '')
+                                      address.put('AddressType', 'bo_BillTo')
+                                      address.put('BPCode', code)
+                                      payload.put('BPAddresses', [address])
+                                      return payload
+                                - marshal:
+                                    json: {}
+                                - removeHeaders:
+                                    pattern: ".*"
+                                - setHeader:
+                                    name: Content-Type
+                                    constant: application/json
+                                - setHeader:
+                                    name: Cookie
+                                    simple: "B1SESSION=${exchangeProperty.sessionId}"
+                                - setHeader:
+                                    name: CamelHttpMethod
+                                    constant: POST
+                                - convertBodyTo:
+                                    type: byte[]
+                                - setProperty:
+                                    name: httpFailed
+                                    constant: "no"
+                                - doTry:
+                                    steps:
+                                      - to: "http://sap-b1:8080/b1s/v1/BusinessPartners?bridgeEndpoint=true&throwExceptionOnFailure=false"
+                                    doCatch:
+                                      - exception:
+                                          - java.lang.Exception
+                                        steps:
+                                          - setProperty:
+                                              name: httpFailed
+                                              constant: "yes"
+                                - choice:
+                                    when:
+                                      - simple: "${exchangeProperty.httpFailed} == 'no'"
+                                        steps:
+                                          - to: direct:sap-after-http
+                                - setProperty:
+                                    name: afterPost
+                                    groovy: |
+                                      def failed = exchange.getProperty('httpFailed') == 'yes'
+                                      def result = exchange.getProperty('httpResult')
+                                      if (result == 'relogin') {
+                                        exchange.setProperty('phase', 'login')
+                                        return 'relogin'
+                                      }
+                                      if (failed || result == 'transient' || result == 'conflict') {
+                                        if (result == 'conflict') exchange.setProperty('sawConflict', 'yes')
+                                        if (failed) {
+                                          int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
+                                          long pause = Math.min(1000L << Math.min(n, 3), 5000L)
+                                          exchange.setProperty('tries', n + 1)
+                                          Thread.sleep(pause)
+                                        }
+                                        exchange.setProperty('phase', 'lookup')
+                                        return 'relookup'
+                                      }
+                                      if (result == 'data') {
+                                        exchange.setProperty('phase', 'stop')
+                                        return 'stop'
+                                      }
+                                      exchange.setProperty('phase', 'done')
+                                      return 'done'
+                - choice:
+                    when:
+                      - simple: "${exchangeProperty.phase} == 'stop'"
+                        steps:
+                          - log:
+                              message: "ошибка данных: system=sap entity=${exchangeProperty.entityId} http=${exchangeProperty.httpCode}"
+                          - to: direct:sap-dlq
+                          - stop: {}
+                - to: direct:write-version
+                - choice:
+                    when:
+                      - simple: "${exchangeProperty.versionWritten} == 'no'"
+                        steps:
+                          - log:
+                              message: "пропуск: версия не новее system=${exchangeProperty.system} entity=${exchangeProperty.entityId} version=${exchangeProperty.version}"
+                          - to: direct:kafka-commit
                     otherwise:
                       steps:
-                        - setProperty:
-                            name: retryHttp
-                            constant: "yes"
-                        - loop:
-                            doWhile: true
-                            expression:
-                              simple: "${exchangeProperty.retryHttp} == 'yes'"
-                            steps:
-                              - setBody:
-                                  groovy: |
-                                    def data = exchange.getProperty('event', Map).get('data')
-                                    def code = exchange.getProperty('cardCode')
-                                    def payload = new java.util.LinkedHashMap()
-                                    payload.put('CardCode', code)
-                                    payload.put('CardName', data.get('Name'))
-                                    payload.put('CardType', 'cCustomer')
-                                    payload.put('Phone1', data.get('Phone') ?: '')
-                                    payload.put('Website', data.get('Web') ?: '')
-                                    payload.put('FederalTaxID', data.get('TaxId') ?: '')
-                                    def address = new java.util.LinkedHashMap()
-                                    address.put('AddressName', 'Bill')
-                                    address.put('Street', data.get('Address') ?: '')
-                                    address.put('ZipCode', data.get('Zip') ?: '')
-                                    address.put('AddressType', 'bo_BillTo')
-                                    address.put('BPCode', code)
-                                    payload.put('BPAddresses', [address])
-                                    return payload
-                              - marshal:
-                                  json: {}
-                              - removeHeaders:
-                                  pattern: ".*"
-                              - setHeader:
-                                  name: Content-Type
-                                  constant: application/json
-                              - setHeader:
-                                  name: Cookie
-                                  simple: "B1SESSION=${exchangeProperty.sessionId}"
-                              - setHeader:
-                                  name: CamelHttpMethod
-                                  constant: POST
-                              - convertBodyTo:
-                                  type: byte[]
-                              - to: "http://sap-b1:8080/b1s/v1/BusinessPartners?bridgeEndpoint=true&throwExceptionOnFailure=false"
-                              - to: direct:sap-after-http
-                        - choice:
-                            when:
-                              - simple: "${exchangeProperty.finished} == 'yes'"
-                                steps:
-                                  - stop: {}
-                - to: direct:write-version
-                - log:
-                    message: "записано: system=${exchangeProperty.system} entity=${exchangeProperty.entityId} version=${exchangeProperty.version}"
-                - to: direct:kafka-commit
+                        - log:
+                            message: "записано: system=${exchangeProperty.system} entity=${exchangeProperty.entityId} version=${exchangeProperty.version}"
+                        - to: direct:kafka-commit

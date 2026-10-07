@@ -2,33 +2,10 @@
     id: directum-account
     autoStartup: false
     from:
-      uri: kafka:crm.account.upserted.v1
+      uri: "kafka:crm.account.upserted.v1,replay.directum.account"
       parameters:
         brokers: redpanda:9092
         groupId: ibus-directum
-        autoOffsetReset: earliest
-        autoCommitEnable: false
-        allowManualCommit: true
-        breakOnFirstError: true
-        maxPollRecords: 1
-        maxPollIntervalMs: 3600000
-        sessionTimeoutMs: 10000
-        heartbeatIntervalMs: 3000
-      steps:
-        - setProperty:
-            name: system
-            constant: directum
-        - to: direct:capture-kafka
-        - to: direct:directum-apply
-
-- route:
-    id: directum-account-replay
-    autoStartup: false
-    from:
-      uri: kafka:replay.directum.account
-      parameters:
-        brokers: redpanda:9092
-        groupId: ibus-directum-replay
         autoOffsetReset: earliest
         autoCommitEnable: false
         allowManualCommit: true
@@ -87,13 +64,13 @@
                 status = Integer.parseInt(code.toString())
               }
               exchange.setProperty('httpCode', status)
-              if (status == 429 || status >= 500 || status == 0) {
-                return 'transient'
-              }
-              if (status >= 400) {
-                return 'data'
-              }
-              return 'ok'
+              if (status >= 200 && status < 300) return 'ok'
+              if (status == 409) return 'conflict'
+              if (status == 401 || status == 403 || status == 408 || status == 429) return 'transient'
+              if (status >= 300 && status < 400) return 'transient'
+              if (status >= 500 || status == 0) return 'transient'
+              if (status >= 400) return 'data'
+              return 'transient'
         - choice:
             when:
               - simple: "${exchangeProperty.httpResult} == 'transient'"
@@ -106,16 +83,33 @@
                         exchange.setProperty('tries', n + 1)
                         Thread.sleep(pause)
                         return 'yes'
+                  - setProperty:
+                      name: conflict
+                      constant: "no"
+              - simple: "${exchangeProperty.httpResult} == 'conflict'"
+                steps:
+                  - setProperty:
+                      name: conflict
+                      constant: "yes"
+                  - setProperty:
+                      name: retryHttp
+                      constant: "no"
+                  - setProperty:
+                      name: finished
+                      constant: "no"
+                  - setProperty:
+                      name: tries
+                      constant: "0"
               - simple: "${exchangeProperty.httpResult} == 'data'"
                 steps:
-                  - log:
-                      message: "ошибка данных: system=directum entity=${exchangeProperty.entityId} http=${exchangeProperty.httpCode}"
-                  - to: direct:directum-dlq
                   - setProperty:
                       name: finished
                       constant: "yes"
                   - setProperty:
                       name: retryHttp
+                      constant: "no"
+                  - setProperty:
+                      name: conflict
                       constant: "no"
                   - setProperty:
                       name: tries
@@ -127,6 +121,9 @@
                     constant: "no"
                 - setProperty:
                     name: retryHttp
+                    constant: "no"
+                - setProperty:
+                    name: conflict
                     constant: "no"
                 - setProperty:
                     name: tries
@@ -162,7 +159,17 @@
               }
               raw = raw.toString()
               exchange.setProperty('rawEvent', raw)
-              def event = new com.fasterxml.jackson.databind.ObjectMapper().readValue(raw, Map.class)
+              exchange.setProperty('poison', 'no')
+              exchange.setProperty('entityId', '')
+              exchange.setProperty('version', '')
+              exchange.setProperty('eventId', '')
+              def event = null
+              try {
+                event = new com.fasterxml.jackson.databind.ObjectMapper().readValue(raw, Map.class)
+              } catch (Exception ignored) {
+                exchange.setProperty('poison', 'yes')
+                return raw
+              }
               def data = event.get('data')
               def entityId = event.get('subject')
               if (entityId == null && data != null) entityId = data.get('Id')
@@ -172,7 +179,19 @@
               exchange.setProperty('version', modified == null ? '' : modified.toString())
               def eventId = event.get('id')
               exchange.setProperty('eventId', eventId == null ? '' : eventId.toString())
-              exchange.setProperty('poison', exchange.getProperty('version') == '' ? 'yes' : 'no')
+              if (exchange.getProperty('version') == '') {
+                exchange.setProperty('poison', 'yes')
+              } else {
+                try {
+                  java.time.OffsetDateTime.parse(exchange.getProperty('version').toString())
+                } catch (Exception ignored) {
+                  try {
+                    java.time.Instant.parse(exchange.getProperty('version').toString())
+                  } catch (Exception ignoredAgain) {
+                    exchange.setProperty('poison', 'yes')
+                  }
+                }
+              }
               return event
         - choice:
             when:
@@ -183,6 +202,10 @@
         - to: direct:read-version
         - choice:
             when:
+              - simple: "${exchangeProperty.applyDecision} == 'poison'"
+                steps:
+                  - to: direct:directum-dlq
+                  - stop: {}
               - simple: "${exchangeProperty.applyDecision} == 'skip'"
                 steps:
                   - log:
@@ -191,81 +214,99 @@
             otherwise:
               steps:
                 - setProperty:
-                    name: lookupReady
+                    name: phase
+                    constant: lookup
+                - setProperty:
+                    name: sawConflict
                     constant: "no"
                 - loop:
                     doWhile: true
                     expression:
-                      simple: "${exchangeProperty.lookupReady} == 'no'"
+                      simple: "${exchangeProperty.phase} == 'lookup' || ${exchangeProperty.phase} == 'patch' || ${exchangeProperty.phase} == 'post'"
                     steps:
-                      - removeHeaders:
-                          pattern: ".*"
-                      - setHeader:
-                          name: Username
-                          constant: ibus
-                      - setHeader:
-                          name: Password
-                          constant: ibus
-                      - setHeader:
-                          name: Accept
-                          constant: application/json
-                      - setHeader:
-                          name: CamelHttpMethod
-                          constant: GET
-                      - setHeader:
-                          name: CamelHttpQuery
-                          simple: "code=${exchangeProperty.creatioId}"
-                      - to: "http://directum-rx:8080/Integration/odata/ICompanies?bridgeEndpoint=true&throwExceptionOnFailure=false"
-                      - setProperty:
-                          name: directumLookup
-                          groovy: |
-                            def code = exchange.getMessage().getHeader('CamelHttpResponseCode')
-                            int status = 0
-                            if (code instanceof Number) {
-                              status = code.intValue()
-                            } else if (code != null && code.toString().trim()) {
-                              status = Integer.parseInt(code.toString())
-                            }
-                            exchange.setProperty('httpCode', status)
-                            if (status == 429 || status >= 500 || status == 0) {
-                              int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
-                              long pause = Math.min(1000L << Math.min(n, 3), 5000L)
-                              exchange.setProperty('tries', n + 1)
-                              exchange.setProperty('lookupReady', 'no')
-                              Thread.sleep(pause)
-                              return 'transient'
-                            }
-                            exchange.setProperty('tries', 0)
-                            exchange.setProperty('lookupReady', 'yes')
-                            if (status >= 400) return 'data'
-                            def raw = exchange.getMessage().getBody(String.class)
-                            def parsed = [:]
-                            if (raw != null && raw.trim()) {
-                              parsed = new com.fasterxml.jackson.databind.ObjectMapper().readValue(raw, Map.class)
-                            }
-                            def rows = parsed.get('value')
-                            if (rows != null && !rows.isEmpty()) {
-                              exchange.setProperty('directumId', rows.get(0).get('Id'))
-                              return 'exists'
-                            }
-                            return 'missing'
-                - choice:
-                    when:
-                      - simple: "${exchangeProperty.directumLookup} == 'data'"
-                        steps:
-                          - log:
-                              message: "ошибка данных: system=directum entity=${exchangeProperty.entityId} http=${exchangeProperty.httpCode}"
-                          - to: direct:directum-dlq
-                          - stop: {}
-                      - simple: "${exchangeProperty.directumLookup} == 'exists'"
-                        steps:
-                          - setProperty:
-                              name: retryHttp
-                              constant: "yes"
-                          - loop:
-                              doWhile: true
-                              expression:
-                                simple: "${exchangeProperty.retryHttp} == 'yes'"
+                      - choice:
+                          when:
+                            - simple: "${exchangeProperty.phase} == 'lookup'"
+                              steps:
+                                - removeHeaders:
+                                    pattern: ".*"
+                                - setHeader:
+                                    name: Username
+                                    constant: ibus
+                                - setHeader:
+                                    name: Password
+                                    constant: ibus
+                                - setHeader:
+                                    name: Accept
+                                    constant: application/json
+                                - setHeader:
+                                    name: CamelHttpMethod
+                                    constant: GET
+                                - setHeader:
+                                    name: CamelHttpQuery
+                                    simple: "code=${exchangeProperty.creatioId}"
+                                - setProperty:
+                                    name: httpFailed
+                                    constant: "no"
+                                - doTry:
+                                    steps:
+                                      - to: "http://directum-rx:8080/Integration/odata/ICompanies?bridgeEndpoint=true&throwExceptionOnFailure=false"
+                                    doCatch:
+                                      - exception:
+                                          - java.lang.Exception
+                                        steps:
+                                          - setProperty:
+                                              name: httpFailed
+                                              constant: "yes"
+                                - setProperty:
+                                    name: directumLookup
+                                    groovy: |
+                                      if (exchange.getProperty('httpFailed') == 'yes') {
+                                        int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
+                                        long pause = Math.min(1000L << Math.min(n, 3), 5000L)
+                                        exchange.setProperty('tries', n + 1)
+                                        Thread.sleep(pause)
+                                        exchange.setProperty('phase', 'lookup')
+                                        return 'transient'
+                                      }
+                                      def code = exchange.getMessage().getHeader('CamelHttpResponseCode')
+                                      int status = 0
+                                      if (code instanceof Number) status = code.intValue()
+                                      else if (code != null && code.toString().trim()) status = Integer.parseInt(code.toString())
+                                      exchange.setProperty('httpCode', status)
+                                      boolean retry = status == 401 || status == 403 || status == 408 || status == 429 || (status >= 300 && status < 400) || status >= 500 || status == 0
+                                      if (retry) {
+                                        int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
+                                        long pause = Math.min(1000L << Math.min(n, 3), 5000L)
+                                        exchange.setProperty('tries', n + 1)
+                                        Thread.sleep(pause)
+                                        exchange.setProperty('phase', 'lookup')
+                                        return 'transient'
+                                      }
+                                      exchange.setProperty('tries', 0)
+                                      if (status >= 400) {
+                                        exchange.setProperty('phase', 'stop')
+                                        return 'data'
+                                      }
+                                      def raw = exchange.getMessage().getBody(String.class)
+                                      def parsed = [:]
+                                      if (raw != null && raw.trim()) {
+                                        parsed = new com.fasterxml.jackson.databind.ObjectMapper().readValue(raw, Map.class)
+                                      }
+                                      def rows = parsed.get('value')
+                                      if (rows != null && !rows.isEmpty()) {
+                                        exchange.setProperty('directumId', rows.get(0).get('Id'))
+                                        exchange.setProperty('phase', 'patch')
+                                        return 'exists'
+                                      }
+                                      if (exchange.getProperty('sawConflict') == 'yes') {
+                                        exchange.setProperty('httpCode', 409)
+                                        exchange.setProperty('phase', 'stop')
+                                        return 'conflict'
+                                      }
+                                      exchange.setProperty('phase', 'post')
+                                      return 'missing'
+                            - simple: "${exchangeProperty.phase} == 'patch'"
                               steps:
                                 - setBody:
                                     groovy: |
@@ -273,9 +314,7 @@
                                       def address = data.get('Address') ?: ''
                                       def zip = data.get('Zip') ?: ''
                                       def legal = address
-                                      if (zip) {
-                                        legal = address ? address + ', ' + zip : zip
-                                      }
+                                      if (zip) legal = address ? address + ', ' + zip : zip
                                       def payload = new java.util.LinkedHashMap()
                                       payload.put('Name', data.get('Name'))
                                       payload.put('TIN', data.get('TaxId') ?: '')
@@ -300,65 +339,135 @@
                                     constant: PATCH
                                 - convertBodyTo:
                                     type: byte[]
-                                - toD: "http://directum-rx:8080/Integration/odata/ICompanies(${exchangeProperty.directumId})?bridgeEndpoint=true&throwExceptionOnFailure=false"
-                                - to: direct:directum-after-http
-                          - choice:
-                              when:
-                                - simple: "${exchangeProperty.finished} == 'yes'"
-                                  steps:
-                                    - stop: {}
+                                - setProperty:
+                                    name: httpFailed
+                                    constant: "no"
+                                - doTry:
+                                    steps:
+                                      - toD: "http://directum-rx:8080/Integration/odata/ICompanies(${exchangeProperty.directumId})?bridgeEndpoint=true&throwExceptionOnFailure=false"
+                                    doCatch:
+                                      - exception:
+                                          - java.lang.Exception
+                                        steps:
+                                          - setProperty:
+                                              name: httpFailed
+                                              constant: "yes"
+                                - choice:
+                                    when:
+                                      - simple: "${exchangeProperty.httpFailed} == 'no'"
+                                        steps:
+                                          - to: direct:directum-after-http
+                                - setProperty:
+                                    name: afterPatch
+                                    groovy: |
+                                      if (exchange.getProperty('httpFailed') == 'yes' || exchange.getProperty('httpResult') == 'transient') {
+                                        if (exchange.getProperty('httpFailed') == 'yes') {
+                                          int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
+                                          long pause = Math.min(1000L << Math.min(n, 3), 5000L)
+                                          exchange.setProperty('tries', n + 1)
+                                          Thread.sleep(pause)
+                                        }
+                                        exchange.setProperty('phase', 'patch')
+                                        return 'retry'
+                                      }
+                                      if (exchange.getProperty('httpResult') == 'data' || exchange.getProperty('httpResult') == 'conflict') {
+                                        exchange.setProperty('phase', 'stop')
+                                        return 'stop'
+                                      }
+                                      exchange.setProperty('phase', 'done')
+                                      return 'done'
+                            - simple: "${exchangeProperty.phase} == 'post'"
+                              steps:
+                                - setBody:
+                                    groovy: |
+                                      def data = exchange.getProperty('event', Map).get('data')
+                                      def address = data.get('Address') ?: ''
+                                      def zip = data.get('Zip') ?: ''
+                                      def legal = address
+                                      if (zip) legal = address ? address + ', ' + zip : zip
+                                      def payload = new java.util.LinkedHashMap()
+                                      payload.put('Name', data.get('Name'))
+                                      payload.put('TIN', data.get('TaxId') ?: '')
+                                      payload.put('Phone', data.get('Phone') ?: '')
+                                      payload.put('LegalAddress', legal)
+                                      payload.put('Code', data.get('Id'))
+                                      return payload
+                                - marshal:
+                                    json: {}
+                                - removeHeaders:
+                                    pattern: ".*"
+                                - setHeader:
+                                    name: Content-Type
+                                    constant: application/json
+                                - setHeader:
+                                    name: Username
+                                    constant: ibus
+                                - setHeader:
+                                    name: Password
+                                    constant: ibus
+                                - setHeader:
+                                    name: CamelHttpMethod
+                                    constant: POST
+                                - convertBodyTo:
+                                    type: byte[]
+                                - setProperty:
+                                    name: httpFailed
+                                    constant: "no"
+                                - doTry:
+                                    steps:
+                                      - to: "http://directum-rx:8080/Integration/odata/ICompanies?bridgeEndpoint=true&throwExceptionOnFailure=false"
+                                    doCatch:
+                                      - exception:
+                                          - java.lang.Exception
+                                        steps:
+                                          - setProperty:
+                                              name: httpFailed
+                                              constant: "yes"
+                                - choice:
+                                    when:
+                                      - simple: "${exchangeProperty.httpFailed} == 'no'"
+                                        steps:
+                                          - to: direct:directum-after-http
+                                - setProperty:
+                                    name: afterPost
+                                    groovy: |
+                                      def failed = exchange.getProperty('httpFailed') == 'yes'
+                                      def result = exchange.getProperty('httpResult')
+                                      if (failed || result == 'transient' || result == 'conflict') {
+                                        if (result == 'conflict') exchange.setProperty('sawConflict', 'yes')
+                                        if (failed) {
+                                          int n = exchange.getProperty('tries') == null ? 0 : exchange.getProperty('tries') as int
+                                          long pause = Math.min(1000L << Math.min(n, 3), 5000L)
+                                          exchange.setProperty('tries', n + 1)
+                                          Thread.sleep(pause)
+                                        }
+                                        exchange.setProperty('phase', 'lookup')
+                                        return 'relookup'
+                                      }
+                                      if (result == 'data') {
+                                        exchange.setProperty('phase', 'stop')
+                                        return 'stop'
+                                      }
+                                      exchange.setProperty('phase', 'done')
+                                      return 'done'
+                - choice:
+                    when:
+                      - simple: "${exchangeProperty.phase} == 'stop'"
+                        steps:
+                          - log:
+                              message: "ошибка данных: system=directum entity=${exchangeProperty.entityId} http=${exchangeProperty.httpCode}"
+                          - to: direct:directum-dlq
+                          - stop: {}
+                - to: direct:write-version
+                - choice:
+                    when:
+                      - simple: "${exchangeProperty.versionWritten} == 'no'"
+                        steps:
+                          - log:
+                              message: "пропуск: версия не новее system=${exchangeProperty.system} entity=${exchangeProperty.entityId} version=${exchangeProperty.version}"
+                          - to: direct:kafka-commit
                     otherwise:
                       steps:
-                        - setProperty:
-                            name: retryHttp
-                            constant: "yes"
-                        - loop:
-                            doWhile: true
-                            expression:
-                              simple: "${exchangeProperty.retryHttp} == 'yes'"
-                            steps:
-                              - setBody:
-                                  groovy: |
-                                    def data = exchange.getProperty('event', Map).get('data')
-                                    def address = data.get('Address') ?: ''
-                                    def zip = data.get('Zip') ?: ''
-                                    def legal = address
-                                    if (zip) {
-                                      legal = address ? address + ', ' + zip : zip
-                                    }
-                                    def payload = new java.util.LinkedHashMap()
-                                    payload.put('Name', data.get('Name'))
-                                    payload.put('TIN', data.get('TaxId') ?: '')
-                                    payload.put('Phone', data.get('Phone') ?: '')
-                                    payload.put('LegalAddress', legal)
-                                    payload.put('Code', data.get('Id'))
-                                    return payload
-                              - marshal:
-                                  json: {}
-                              - removeHeaders:
-                                  pattern: ".*"
-                              - setHeader:
-                                  name: Content-Type
-                                  constant: application/json
-                              - setHeader:
-                                  name: Username
-                                  constant: ibus
-                              - setHeader:
-                                  name: Password
-                                  constant: ibus
-                              - setHeader:
-                                  name: CamelHttpMethod
-                                  constant: POST
-                              - convertBodyTo:
-                                  type: byte[]
-                              - to: "http://directum-rx:8080/Integration/odata/ICompanies?bridgeEndpoint=true&throwExceptionOnFailure=false"
-                              - to: direct:directum-after-http
-                        - choice:
-                            when:
-                              - simple: "${exchangeProperty.finished} == 'yes'"
-                                steps:
-                                  - stop: {}
-                - to: direct:write-version
-                - log:
-                    message: "записано: system=${exchangeProperty.system} entity=${exchangeProperty.entityId} version=${exchangeProperty.version}"
-                - to: direct:kafka-commit
+                        - log:
+                            message: "записано: system=${exchangeProperty.system} entity=${exchangeProperty.entityId} version=${exchangeProperty.version}"
+                        - to: direct:kafka-commit

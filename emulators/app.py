@@ -8,6 +8,7 @@ SERVICE selects which contract this process speaks:
 
 import json
 import os
+import socket
 import threading
 import time
 import urllib.error
@@ -31,6 +32,8 @@ reject_codes = set()
 directum_down = False
 directum_data_error = False
 directum_delay_s = 0
+directum_unauthorized = False
+directum_drop_create = False
 next_company_id = 1
 
 
@@ -135,9 +138,12 @@ class Handler(BaseHTTPRequestHandler):
             inbox.clear()
             reject_codes.clear()
             global next_company_id, directum_down, directum_data_error, directum_delay_s
+            global directum_unauthorized, directum_drop_create
             directum_down = False
             directum_data_error = False
             directum_delay_s = 0
+            directum_unauthorized = False
+            directum_drop_create = False
             next_company_id = 1
         send(self, 200, {"status": "cleared"})
 
@@ -323,6 +329,9 @@ class Handler(BaseHTTPRequestHandler):
         if directum_is_down():
             send(self, 503, {"error": {"message": "Directum unavailable"}})
             return
+        if directum_unauthorized_on():
+            send(self, 401, {"error": {"message": "unauthorized"}})
+            return
         if path != "/Integration/odata/ICompanies":
             send(self, 404, {"error": "not found"})
             return
@@ -348,6 +357,18 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 directum_data_error = path == "/pilot/data-error"
             send(self, 200, {"status": "data-error" if directum_data_error else "data-ok"})
+            return
+        if path in ("/pilot/unauthorized", "/pilot/authorized"):
+            global directum_unauthorized
+            with lock:
+                directum_unauthorized = path == "/pilot/unauthorized"
+            send(self, 200, {"status": "unauthorized" if directum_unauthorized else "authorized"})
+            return
+        if path == "/pilot/drop-create":
+            global directum_drop_create
+            with lock:
+                directum_drop_create = True
+            send(self, 200, {"status": "drop-create"})
             return
         if path == "/pilot/delay":
             try:
@@ -388,6 +409,9 @@ class Handler(BaseHTTPRequestHandler):
         if directum_is_down():
             send(self, 503, {"error": {"message": "Directum unavailable"}})
             return
+        if directum_unauthorized_on():
+            send(self, 401, {"error": {"message": "unauthorized"}})
+            return
         if directum_data_error_on():
             send(self, 400, {"error": {"message": "data rejected"}})
             return
@@ -414,6 +438,12 @@ class Handler(BaseHTTPRequestHandler):
             }
             next_company_id += 1
             companies[company["Id"]] = company
+            drop = directum_drop_create
+            if drop:
+                directum_drop_create = False
+        if drop:
+            drop_response(self)
+            return
         pilot_delay()
         send(self, 201, company)
 
@@ -432,6 +462,9 @@ class Handler(BaseHTTPRequestHandler):
         remember("PATCH", path_of(self), body)
         if directum_is_down():
             send(self, 503, {"error": {"message": "Directum unavailable"}})
+            return
+        if directum_unauthorized_on():
+            send(self, 401, {"error": {"message": "unauthorized"}})
             return
         if directum_data_error_on():
             send(self, 400, {"error": {"message": "data rejected"}})
@@ -455,6 +488,19 @@ class Handler(BaseHTTPRequestHandler):
                     company[field] = body[field]
         pilot_delay()
         send(self, 200, company)
+
+
+def drop_response(handler):
+    handler.close_connection = True
+    try:
+        handler.connection.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def directum_unauthorized_on():
+    with lock:
+        return directum_unauthorized
 
 
 def directum_is_down():

@@ -38,6 +38,7 @@
     .lead { color: var(--muted); max-width: 76ch; }
     .layout { display: grid; grid-template-columns: 360px 1fr; gap: 16px; margin-top: 18px; }
     .boards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .db-state { grid-column: 1 / -1; }
     section {
       background: var(--card);
       border: 1px solid var(--line);
@@ -100,6 +101,9 @@
       overflow: auto;
     }
     .err { color: var(--bad); font-size: 13px; margin-top: 6px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 8px 8px 8px 0; border-top: 1px solid var(--line); vertical-align: top; word-break: break-all; }
+    th { color: var(--muted); font-weight: 650; border-top: 0; }
     @media (max-width: 1000px) {
       .layout, .boards, .topic-grid, .packet-grid { grid-template-columns: 1fr; }
     }
@@ -180,6 +184,14 @@
           <div class="card-head"><h2>Directum RX</h2><span class="count" id="directum-count"></span></div>
           <div id="directum"></div>
         </section>
+        <section class="db-state">
+          <div class="card-head">
+            <h2>База шины</h2>
+            <span class="count" id="delivery-count"></span>
+          </div>
+          <p class="lead">PostgreSQL на шине, таблица <code>delivery_state</code>: последняя версия, которую система уже приняла. Версия — это <code>ModifiedOn</code> карточки Creatio. Пока строки нет, эта система карточку ещё не приняла.</p>
+          <div id="delivery"></div>
+        </section>
       </div>
     </div>
 
@@ -204,15 +216,6 @@
           <pre id="packet-directum">Пока пусто.</pre>
         </section>
       </div>
-    </section>
-
-    <section class="topics">
-      <div class="card-head">
-        <h2>Что записано</h2>
-        <span class="count" id="delivery-count"></span>
-      </div>
-      <p class="lead">Последняя версия, которую шина уже применила в каждой системе. Версия — это <code>ModifiedOn</code> карточки Creatio. Пока строки нет, система эту карточку ещё не приняла.</p>
-      <div id="delivery"></div>
     </section>
 
     <section class="topics">
@@ -425,22 +428,39 @@
     function renderDelivery(rows, errorText) {
       const root = document.querySelector("#delivery");
       const count = document.querySelector("#delivery-count");
-      count.textContent = rows.length ? String(rows.length) : "";
+      count.textContent = errorText ? "нет ответа" : (rows.length ? String(rows.length) : "0");
       root.replaceChildren();
+      const table = document.createElement("table");
+      const head = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      ["Система", "Контрагент", "Версия", "Событие", "Записано"].forEach((title) => {
+        const cell = document.createElement("th");
+        cell.textContent = title;
+        headRow.appendChild(cell);
+      });
+      head.appendChild(headRow);
+      const body = document.createElement("tbody");
       if (!rows.length) {
-        const p = document.createElement("p");
-        p.className = "empty";
-        p.textContent = "Пока ни одна система не записала версию.";
-        root.appendChild(p);
+        const row = document.createElement("tr");
+        const cell = document.createElement("td");
+        cell.colSpan = 5;
+        cell.className = "empty";
+        cell.textContent = errorText ? "База не ответила." : "Пока ни одна система не записала версию.";
+        row.appendChild(cell);
+        body.appendChild(row);
       } else {
-        const list = document.createElement("ul");
-        rows.forEach((row) => list.appendChild(item(row.system + " · " + row.entity_id, [
-          "версия " + row.version,
-          "событие " + row.event_id,
-          row.applied_at ? "записано " + row.applied_at : ""
-        ].filter(Boolean))));
-        root.appendChild(list);
+        rows.forEach((row) => {
+          const tr = document.createElement("tr");
+          [row.system, row.entity_id, row.version, row.event_id, row.applied_at || ""].forEach((value) => {
+            const cell = document.createElement("td");
+            cell.textContent = value || "";
+            tr.appendChild(cell);
+          });
+          body.appendChild(tr);
+        });
       }
+      table.append(head, body);
+      root.appendChild(table);
       if (errorText) {
         const err = document.createElement("p");
         err.className = "err";

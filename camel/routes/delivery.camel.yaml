@@ -50,6 +50,22 @@
         - setProperty:
             name: applyDecision
             groovy: |
+              def asInstant = { value ->
+                if (value == null) return null
+                if (value instanceof java.time.OffsetDateTime) return value.toInstant()
+                if (value instanceof java.time.Instant) return value
+                if (value instanceof java.sql.Timestamp) return value.toInstant()
+                if (value instanceof java.util.Date) return value.toInstant()
+                def text = value.toString().trim()
+                if (!text) return null
+                try { return java.time.OffsetDateTime.parse(text).toInstant() } catch (Exception ignored) {}
+                try { return java.time.Instant.parse(text) } catch (Exception ignored) {}
+                def normalized = text.replace(' ', 'T')
+                if (normalized.endsWith('+00')) normalized = normalized.substring(0, normalized.length() - 3) + 'Z'
+                try { return java.time.OffsetDateTime.parse(normalized).toInstant() } catch (Exception ignored) {}
+                try { return java.time.LocalDateTime.parse(text).toInstant(java.time.ZoneOffset.UTC) } catch (Exception ignored) {}
+                return null
+              }
               def row = body
               if (row instanceof List) {
                 row = row ? row.get(0) : null
@@ -59,13 +75,17 @@
                 stored = row.get('version')
                 if (stored == null) stored = row.get('VERSION')
               } else if (row != null) {
-                stored = row.toString()
+                stored = row
               }
-              if (stored != null) {
-                exchange.setProperty('storedVersion', stored.toString())
+              def storedInstant = asInstant(stored)
+              if (storedInstant != null) {
+                exchange.setProperty('storedVersion', storedInstant.toString())
               }
-              def incoming = exchange.getProperty('version')
-              if (stored != null && incoming != null && stored.toString().compareTo(incoming.toString()) >= 0) {
+              def incomingInstant = asInstant(exchange.getProperty('version'))
+              if (exchange.getProperty('version') && incomingInstant == null) {
+                return 'poison'
+              }
+              if (storedInstant != null && incomingInstant != null && !incomingInstant.isAfter(storedInstant)) {
                 return 'skip'
               }
               return 'apply'
@@ -92,9 +112,20 @@
         - to:
             uri: sql
             parameters:
-              query: "INSERT INTO delivery_state (system, entity_id, version, event_id, applied_at) VALUES (:#system, :#entityId, :#version, :#eventId, CURRENT_TIMESTAMP) ON CONFLICT (system, entity_id) DO UPDATE SET version = EXCLUDED.version, event_id = EXCLUDED.event_id, applied_at = CURRENT_TIMESTAMP"
+              query: "INSERT INTO delivery_state (system, entity_id, version, event_id, applied_at) VALUES (:#system, :#entityId, CAST(:#version AS timestamptz), :#eventId, CURRENT_TIMESTAMP) ON CONFLICT (system, entity_id) DO UPDATE SET version = EXCLUDED.version, event_id = EXCLUDED.event_id, applied_at = CURRENT_TIMESTAMP WHERE delivery_state.version < EXCLUDED.version"
               dataSource: "#deliveryDataSource"
               useMessageBodyForSql: false
+        - setProperty:
+            name: versionWritten
+            groovy: |
+              def count = exchange.getMessage().getHeader('CamelSqlUpdateCount')
+              int updated = 0
+              if (count instanceof Number) {
+                updated = count.intValue()
+              } else if (count != null && count.toString().trim()) {
+                updated = Integer.parseInt(count.toString())
+              }
+              return updated > 0 ? 'yes' : 'no'
 
 - route:
     id: kafka-commit
@@ -140,7 +171,11 @@
               rows.each { row ->
                 def out = new java.util.LinkedHashMap()
                 row.each { key, value ->
-                  out.put(key.toString(), value == null ? null : value.toString())
+                  def text = null
+                  if (value instanceof java.time.OffsetDateTime) text = value.toInstant().toString()
+                  else if (value instanceof java.sql.Timestamp) text = value.toInstant().toString()
+                  else if (value != null) text = value.toString()
+                  out.put(key.toString(), text)
                 }
                 mapped.add(out)
               }

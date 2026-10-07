@@ -408,7 +408,7 @@ class Handler(BaseHTTPRequestHandler):
     def _replay(self, system):
         source = "dlq.%s.account" % system
         target = "replay.%s.account" % system
-        group = "ibus-%s-replay" % system
+        group = "ibus-%s" % system
         record = self._last_raw(source)
         if record is None:
             self._send(409, {"error": "В списке ошибок пусто"})
